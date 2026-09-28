@@ -4,6 +4,7 @@ Capture new durable conventions, invariants, and recurring pitfalls here when th
 - Keep the daemon level-triggered: hooks only nudge; `decide::Tracker::observe` recomputes the hold from a full snapshot. Don't add logic that depends on seeing a particular event.
 - Use herdr's semantic `agent_status` as the source of truth; inspect `herdr agent explain` when its classification seems wrong instead of inferring activity from process CPU or terminal output here.
 - Keep one controller running while installed. Poll slowly only after a complete zero-session snapshot and once any grace hold has ended; an unreadable session list must keep being retried. Never renew a hold from a snapshot older than 60s.
+- The controller is long-lived, so rotate its log during runtime. Keep the current log inode open when rotating because the keeper's stderr is a cloned handle to it.
 - Keep `poll_secs` below the shared `MAX_SNAPSHOT_AGE` limit so normal polling cannot repeatedly expire and restart the keeper.
 - Fail toward letting Windows sleep. Any new failure path should end in a released hold (grace period at most), never an indefinite one.
 - Windows PowerShell 5.1 pitfalls in `src/keeper.ps1`:

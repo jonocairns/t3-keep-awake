@@ -41,11 +41,11 @@ enum Msg {
 
 pub fn run() -> Result<()> {
     let paths = Paths::resolve()?;
-    let log = Log::open(&paths.log())?;
     // Hooks race to start the daemon; the lock picks one winner and the rest leave quietly.
     let Some(_lock) = try_lock(&paths.lock())? else {
         return Ok(());
     };
+    let log = Log::open(&paths.log())?;
     let config = match config_file().and_then(|path| Config::load(&path)) {
         Ok(config) => config,
         Err(error) => {

@@ -6,13 +6,14 @@ working inside WSL, and lets it sleep again once they're all done.
 ```
 herdr events ──nudge──┐
                       ▼
-poll every 10s ──► daemon (one per WSL distro, flock)
-or 60s if idle       hold only from a fresh herdr snapshot
-                    hold = any agent working, or one was within the grace period
-                      │ stdin heartbeat every 15s
-                      ▼
-               powershell.exe keeper: SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
-               lets go when stdin closes, or after 60s without a heartbeat
+periodic poll ─────► WSL daemon (one per distro, flock)
+                     full herdr snapshot → desired hold
+                     10s polling while active; 60s with no server and no hold
+                     a snapshot can authorize a hold for at most 60s
+                       │ stdin heartbeat every 15s while holding
+                       ▼
+                     powershell.exe keeper: SetThreadExecutionState
+                     releases on stdin close or after 60s without a heartbeat
 ```
 
 The screen still turns off and locks as usual; only sleep is blocked (set
@@ -37,6 +38,8 @@ cd ~/herdr-keep-awake
 `install.sh` builds, links the plugin into herdr, symlinks the CLI into
 `~/.local/bin`, and (re)starts the daemon. Re-run it after pulling.
 `./uninstall.sh` stops the daemon (releasing any hold) and unlinks the plugin.
+The daemon stays running while idle so it can discover a Herdr server that
+returns without another hook event.
 
 ## Use
 
@@ -46,13 +49,21 @@ It runs by itself. To see what it's doing:
 herdr-keep-awake status   # held or not, why, which agents, keeper health
 herdr-keep-awake log 30   # state transitions, keeper restarts, herdr errors
 herdr-keep-awake probe    # Windows' own view: is anything blocking sleep?
+herdr-keep-awake restart  # apply config or binary changes
+herdr-keep-awake stop     # release the hold and stop until a hook or restart
 ```
 
 In herdr, the **Keep awake: status** action opens the same status as a popup.
+Just after startup, status may briefly say `reading herdr` before the first
+snapshot finishes.
 
 `probe` reads the system-wide execution state with `CallNtPowerInformation`,
 so it needs no admin rights (unlike `powercfg /requests`). It reports every
 Windows process's requests, not only this plugin's.
+
+The daemon logs state changes and errors to `~/.local/state/herdr-keep-awake/daemon.log`.
+It rotates on the next daemon log entry after about 1 MiB, retaining one
+`daemon.log.1` archive. `log` reads the current file.
 
 ## Configure
 
@@ -63,12 +74,12 @@ rejected). Run `herdr-keep-awake restart` after editing.
 |---|---|---|
 | `grace_secs` | `300` | Keep holding this long after the last working agent. Bridges gaps between turns, and covers a briefly unreadable herdr. |
 | `hold_blocked` | `false` | Whether an agent waiting on a permission prompt keeps Windows awake. |
-| `max_working_secs` | `28800` | One uninterrupted working stretch longer than this is treated as a stuck status and stops counting. |
+| `max_working_secs` | `28800` | One uninterrupted working stretch longer than this is treated as a stuck status and stops counting. Its timer restarts with the daemon. |
 | `keep_display_on` | `false` | Also keep the display on. |
-| `poll_secs` | `10` | How often herdr is read when no event arrives. Must be less than 60s so a working snapshot stays fresh. |
+| `poll_secs` | `10` | How often herdr is read while a session runs, a hold is wanted, or a read failed. Must be less than 60s so a working snapshot stays fresh. |
 | `idle_poll_secs` | `60` | How often to look for a herdr server when none is running and no hold is wanted. |
 | `heartbeat_secs` | `15` | How often the daemon pings the keeper. |
-| `keeper_timeout_secs` | `60` | The keeper lets go after this long without a ping. Must be at least 2x `heartbeat_secs`. |
+| `keeper_timeout_secs` | `60` | The keeper lets go after this long without a ping. Must be at least 2x `heartbeat_secs` and fit PowerShell's millisecond timeout. |
 
 The old `idle_exit_secs` key is accepted for existing configs but has no effect.
 
@@ -78,17 +89,23 @@ The old `idle_exit_secs` key is accepted for existing configs but has no effect.
   starting it if it isn't running. The daemon then reads every agent in every
   running herdr session and works out the answer from scratch, so concurrent,
   duplicated, or missed events can't leave it in the wrong state. It also
-  polls every 10s while a server is running or the hold is in its grace
-  period. With no server and no hold, it checks every 60s so it can discover
-  a recovered server without another hook.
+  polls every 10s by default while a server runs, a hold is wanted, or a read
+  failed. After a readable zero-session snapshot and with no hold, it checks
+  every 60s by default so it can discover a server without another hook.
 - **One daemon.** A lock file decides which process wins when hooks race to
   start it; the rest exit quietly.
 - **Stuck on is harder than stuck off.** If the daemon dies, the keeper's
   stdin closes and it lets go. If the daemon or WSL hangs, the heartbeats stop
-  and the keeper lets go after 60s. If herdr can't be read, the hold lasts
+  and the keeper lets go after 60s. A readable working agent still counts if
+  another session fails to read; with none confirmed, a previous hold lasts
   only through the grace period. An agent stuck showing `working` stops
   counting after `max_working_secs`. A snapshot older than 60s cannot keep
-  renewing the hold.
+  renewing the hold. Each herdr CLI call has a 5s timeout, and a full snapshot
+  has a 30s budget.
+- **Herdr updates are tolerated.** If a hook supplies a path to a Herdr binary
+  that has since been removed, the daemon uses `herdr` from `PATH` on its next
+  read. A closed or incomplete daemon socket reply is treated as an error, so
+  a hook can restart the daemon.
 - **Keeper failures are retried** with backoff from 1s up to 60s, and a keeper
   that stops answering heartbeats is killed and replaced. Killing the WSL-side
   `powershell.exe` process also ends the Windows process.
