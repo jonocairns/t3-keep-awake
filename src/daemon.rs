@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::Config;
+use crate::config::{Config, MAX_SNAPSHOT_AGE};
 use crate::decide::{Decision, Tracker};
 use crate::herdr::Herdr;
 use crate::keeper::{self, Keeper, Line, Phase};
@@ -68,11 +68,12 @@ pub fn run() -> Result<()> {
     let status = Arc::new(Mutex::new(Status::default()));
     log.line(format!("started: pid {}, {config:?}", process::id()));
 
+    *status.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Status { daemon_pid: process::id(), reason: "reading herdr".into(), ..Status::default() };
     let mut daemon = Daemon::new(config, log, tx.clone(), Arc::clone(&status));
-    // Settle once before serving: clients queue in the socket backlog
-    // meanwhile, so the first `status` is never a blank default.
-    daemon.tick(Instant::now());
     spawn_listener(listener, tx, status);
+    // Serve hooks promptly even when the first herdr snapshot is slow.
+    daemon.tick(Instant::now());
     let result = daemon.run(&rx);
     daemon.shutdown();
     // Remove the socket before the lock drops, so a successor never sees ours.
@@ -158,7 +159,7 @@ struct Daemon {
     poll_requested: bool,
     running_sessions: usize,
     herdr_errors: Vec<String>,
-    last_server_seen: Instant,
+    snapshot_expired: bool,
     keeper: Option<Keeper>,
     generation: u64,
     failures: u32,
@@ -181,7 +182,7 @@ impl Daemon {
             poll_requested: true,
             running_sessions: 0,
             herdr_errors: Vec::new(),
-            last_server_seen: now,
+            snapshot_expired: false,
             keeper: None,
             generation: 0,
             failures: 0,
@@ -207,38 +208,40 @@ impl Daemon {
             }
             let now = Instant::now();
             self.tick(now);
-            if self.keeper.is_none() && now.duration_since(self.last_server_seen) >= self.config.idle_exit() {
-                self.log.line(format!(
-                    "no running herdr server for {}; exiting until the next herdr hook starts me",
-                    fmt_duration(self.config.idle_exit())
-                ));
-                return Ok(());
-            }
         }
     }
 
     fn tick(&mut self, now: Instant) {
         if self.poll_due(now) {
-            self.poll(now);
+            self.poll();
         }
-        self.reconcile(now);
-        self.publish_status(now);
+        let now = Instant::now();
+        let (decision, expired) = current_decision(&self.decision, self.last_poll, now);
+        if expired && !self.snapshot_expired {
+            self.log.line("release: herdr snapshot stale");
+        }
+        self.snapshot_expired = expired;
+        self.reconcile(now, decision.hold);
+        self.publish_status(now, &decision);
     }
 
     fn poll_due(&self, now: Instant) -> bool {
         let Some(last) = self.last_poll else { return true };
         let since = now.duration_since(last);
-        (self.poll_requested && since >= NUDGE_DEBOUNCE) || since >= self.config.poll()
+        let interval = if self.running_sessions == 0 && self.herdr_errors.is_empty() && !self.decision.hold {
+            self.config.idle_poll()
+        } else {
+            self.config.poll()
+        };
+        (self.poll_requested && since >= NUDGE_DEBOUNCE) || since >= interval
     }
 
-    fn poll(&mut self, now: Instant) {
+    fn poll(&mut self) {
         let snapshot = self.herdr.snapshot();
+        let now = Instant::now();
         self.last_poll = Some(now);
         self.poll_requested = false;
         self.running_sessions = snapshot.running_sessions;
-        if snapshot.running_sessions > 0 {
-            self.last_server_seen = now;
-        }
         if snapshot.errors != self.herdr_errors {
             for error in &snapshot.errors {
                 self.log.line(format!("herdr: {error}"));
@@ -250,7 +253,7 @@ impl Daemon {
         }
 
         let decision = self.tracker.observe(&snapshot.agents, snapshot.complete(), now, &self.config);
-        if decision.hold != self.decision.hold {
+        if decision.hold != self.decision.hold || (decision.hold && self.snapshot_expired) {
             let verb = if decision.hold { "hold" } else { "release" };
             self.log.line(format!("{verb}: {}", decision.reason));
         }
@@ -261,11 +264,12 @@ impl Daemon {
             self.log.line(format!("ignoring as stuck: {}", decision.stale.join(", ")));
         }
         self.decision = decision;
+        self.snapshot_expired = false;
     }
 
-    fn reconcile(&mut self, now: Instant) {
+    fn reconcile(&mut self, now: Instant, hold: bool) {
         self.reap(now);
-        if self.decision.hold {
+        if hold {
             self.ensure_holding(now);
         } else {
             self.ensure_released(now);
@@ -404,7 +408,7 @@ impl Daemon {
         }
     }
 
-    fn publish_status(&self, now: Instant) {
+    fn publish_status(&self, now: Instant, decision: &Decision) {
         let keeper = self.keeper.as_ref().map(|keeper| {
             let (phase, since, windows_pid) = match keeper.phase {
                 Phase::Starting => ("starting", keeper.spawned, None),
@@ -421,10 +425,10 @@ impl Daemon {
         let status = Status {
             daemon_pid: process::id(),
             uptime_secs: now.duration_since(self.started).as_secs(),
-            hold: self.decision.hold,
-            reason: self.decision.reason.clone(),
-            active: self.decision.active.clone(),
-            stale: self.decision.stale.clone(),
+            hold: decision.hold,
+            reason: decision.reason.clone(),
+            active: decision.active.clone(),
+            stale: decision.stale.clone(),
             keeper,
             running_sessions: self.running_sessions,
             last_poll_secs_ago: self.last_poll.map_or(0, |at| now.duration_since(at).as_secs()),
@@ -455,5 +459,35 @@ impl Daemon {
             }
         }
         self.log.line("stopped");
+    }
+}
+
+fn current_decision(decision: &Decision, last_poll: Option<Instant>, now: Instant) -> (Decision, bool) {
+    let expired = decision.hold && last_poll.is_some_and(|at| now.duration_since(at) >= MAX_SNAPSHOT_AGE);
+    if expired {
+        (Decision { hold: false, reason: "herdr snapshot stale".into(), ..Decision::default() }, true)
+    } else {
+        (decision.clone(), false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_old_working_snapshot_cannot_keep_renewing_the_hold() {
+        let polled = Instant::now();
+        let working = Decision {
+            hold: true,
+            reason: "1 agent working".into(),
+            active: vec!["agent".into()],
+            ..Decision::default()
+        };
+        assert!(current_decision(&working, Some(polled), polled + MAX_SNAPSHOT_AGE - Duration::from_secs(1)).0.hold);
+        let (decision, expired) = current_decision(&working, Some(polled), polled + MAX_SNAPSHOT_AGE);
+        assert!(expired);
+        assert!(!decision.hold);
+        assert_eq!(decision.reason, "herdr snapshot stale");
     }
 }

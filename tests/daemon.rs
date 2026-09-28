@@ -30,7 +30,7 @@ echo "exit $$" >> "$FAKE_DIR/keeper.log"
 echo "released stdin-closed"
 "#;
 
-const CONFIG: &str = "poll_secs = 1\ngrace_secs = 2\nheartbeat_secs = 1\nkeeper_timeout_secs = 3\n";
+const CONFIG: &str = "poll_secs = 1\nidle_poll_secs = 2\ngrace_secs = 2\nheartbeat_secs = 1\nkeeper_timeout_secs = 3\n";
 
 struct Harness {
     dir: PathBuf,
@@ -44,11 +44,21 @@ impl Harness {
         write_executable(&dir.join("herdr"), FAKE_HERDR);
         write_executable(&dir.join("keeper"), FAKE_KEEPER);
         fs::write(dir.join("config.toml"), CONFIG).unwrap();
-        fs::write(dir.join("sessions.json"), r#"{"sessions":[{"default":true,"name":"default","running":true}]}"#)
-            .unwrap();
         let harness = Self { dir };
+        harness.set_session_running(true);
         harness.set_agents(&[]);
         harness
+    }
+
+    fn set_session_running(&self, running: bool) {
+        let sessions = if running {
+            r#"{"sessions":[{"default":true,"name":"default","running":true}]}"#
+        } else {
+            r#"{"sessions":[]}"#
+        };
+        let tmp = self.dir.join("sessions.tmp");
+        fs::write(&tmp, sessions).unwrap();
+        fs::rename(&tmp, self.dir.join("sessions.json")).unwrap();
     }
 
     fn command(&self, args: &[&str]) -> Command {
@@ -208,9 +218,7 @@ fn concurrent_hooks_start_exactly_one_daemon() {
     for mut hook in hooks {
         assert!(hook.wait().unwrap().success());
     }
-    // The hook returns once the daemon answers, and it only answers after its
-    // first poll, so status is already real here.
-    let status = h.status().expect("daemon answering");
+    let status = h.wait_for("the first snapshot", |s| s["running_sessions"] == 1);
     assert_ne!(status["daemon_pid"], 0);
     assert_eq!(status["running_sessions"], 1);
     assert_eq!(h.log().matches("started: pid").count(), 1, "log:\n{}", h.log());
@@ -245,4 +253,34 @@ fn an_unreadable_herdr_releases_after_the_grace_period() {
     fs::write(h.dir.join("agents-default.json"), "not json").unwrap();
     h.wait_for("the release", |s| s["hold"] == false && s["reason"] == "herdr unreadable");
     assert!(h.log().contains("herdr: session default: parsing agent list"));
+}
+
+#[test]
+fn an_idle_controller_discovers_work_without_another_hook() {
+    let h = Harness::new("idle-recovery");
+    h.set_session_running(false);
+    h.run(&["startup"]);
+    let idle = h.wait_for("no running session", |s| s["running_sessions"] == 0 && s["reason"] == "no agents working");
+    thread::sleep(Duration::from_secs(3));
+    assert_eq!(h.status().unwrap()["daemon_pid"], idle["daemon_pid"]);
+
+    h.set_agents(&[("w1:p1", "working")]);
+    h.set_session_running(true);
+    let holding = h.wait_for("work found by the idle poll", holding);
+    assert_eq!(holding["daemon_pid"], idle["daemon_pid"]);
+}
+
+#[test]
+fn a_broken_session_list_recovers_without_another_hook() {
+    let h = Harness::new("list-recovery");
+    h.set_agents(&[("w1:p1", "working")]);
+    h.run(&["startup"]);
+    let initial = h.wait_for("the initial hold", holding);
+
+    fs::write(h.dir.join("sessions.json"), "not json").unwrap();
+    h.wait_for("release after unreadable herdr", |s| s["hold"] == false && s["reason"] == "herdr unreadable");
+
+    h.set_session_running(true);
+    let recovered = h.wait_for("hold after herdr recovers", holding);
+    assert_eq!(recovered["daemon_pid"], initial["daemon_pid"]);
 }

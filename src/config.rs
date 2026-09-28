@@ -6,12 +6,17 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+/// A working decision is released when its source snapshot reaches this age.
+pub const MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(60);
+
 /// Read once when the daemon starts; `herdr-keep-awake restart` applies edits.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// How often herdr is polled when no event arrives.
     pub poll_secs: u64,
+    /// How often to look for a herdr server when none is running.
+    pub idle_poll_secs: u64,
     /// How long the hold outlasts the last working agent. Bridges the gaps
     /// between turns and tool calls, and covers a briefly unreadable herdr.
     pub grace_secs: u64,
@@ -26,21 +31,23 @@ pub struct Config {
     pub heartbeat_secs: u64,
     /// The keeper releases the hold if it hears nothing for this long.
     pub keeper_timeout_secs: u64,
-    /// The daemon exits after this long without a running herdr server.
-    pub idle_exit_secs: u64,
+    /// Accepted for config compatibility; the controller now stays running.
+    #[serde(skip_serializing)]
+    pub idle_exit_secs: Option<u64>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             poll_secs: 10,
+            idle_poll_secs: 60,
             grace_secs: 300,
             max_working_secs: 8 * 60 * 60,
             hold_blocked: false,
             keep_display_on: false,
             heartbeat_secs: 15,
             keeper_timeout_secs: 60,
-            idle_exit_secs: 600,
+            idle_exit_secs: None,
         }
     }
 }
@@ -58,17 +65,28 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.poll_secs == 0 || self.heartbeat_secs == 0 {
-            bail!("poll_secs and heartbeat_secs must be at least 1");
+        if self.poll_secs == 0 || self.idle_poll_secs == 0 || self.heartbeat_secs == 0 {
+            bail!("poll_secs, idle_poll_secs, and heartbeat_secs must be at least 1");
         }
-        if self.keeper_timeout_secs < self.heartbeat_secs * 2 {
+        if self.poll() >= MAX_SNAPSHOT_AGE {
+            bail!("poll_secs must be less than {} to keep working snapshots fresh", MAX_SNAPSHOT_AGE.as_secs());
+        }
+        let min_timeout = self.heartbeat_secs.checked_mul(2).context("heartbeat_secs is too large")?;
+        if self.keeper_timeout_secs < min_timeout {
             bail!("keeper_timeout_secs must be at least twice heartbeat_secs");
+        }
+        if self.keeper_timeout_secs > i32::MAX as u64 / 1000 {
+            bail!("keeper_timeout_secs is too large for PowerShell's millisecond timeout");
         }
         Ok(())
     }
 
     pub fn poll(&self) -> Duration {
         Duration::from_secs(self.poll_secs)
+    }
+
+    pub fn idle_poll(&self) -> Duration {
+        Duration::from_secs(self.idle_poll_secs)
     }
 
     pub fn grace(&self) -> Duration {
@@ -85,10 +103,6 @@ impl Config {
 
     pub fn keeper_timeout(&self) -> Duration {
         Duration::from_secs(self.keeper_timeout_secs)
-    }
-
-    pub fn idle_exit(&self) -> Duration {
-        Duration::from_secs(self.idle_exit_secs)
     }
 }
 
@@ -122,8 +136,19 @@ mod tests {
     }
 
     #[test]
+    fn the_old_idle_exit_setting_is_accepted_but_ignored() {
+        assert_eq!(parse("idle_exit_secs = 600\n").unwrap().idle_poll_secs, 60);
+    }
+
+    #[test]
     fn a_keeper_timeout_that_a_single_late_heartbeat_would_trip_is_rejected() {
         assert!(parse("heartbeat_secs = 15\nkeeper_timeout_secs = 20\n").is_err());
         assert!(parse("poll_secs = 0\n").is_err());
+        assert!(parse("poll_secs = 59\n").is_ok());
+        assert!(parse("poll_secs = 60\n").is_err());
+        assert!(parse("poll_secs = 90\n").is_err());
+        assert!(parse("idle_poll_secs = 0\n").is_err());
+        assert!(parse("heartbeat_secs = 18446744073709551615\n").is_err());
+        assert!(parse("keeper_timeout_secs = 2147484\n").is_err());
     }
 }

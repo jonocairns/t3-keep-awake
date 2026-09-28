@@ -23,10 +23,19 @@ fn request(paths: &Paths, command: &str) -> Result<String> {
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     (&stream).write_all(format!("{command}\n").as_bytes())?;
     let mut reply = String::new();
-    BufReader::new(&stream).read_line(&mut reply)?;
+    if BufReader::new(&stream).read_line(&mut reply)? == 0 {
+        bail!("daemon closed the connection without a reply");
+    }
     let reply = reply.trim();
     if let Some(error) = reply.strip_prefix("error ") {
         bail!("daemon: {error}");
+    }
+    match command {
+        "nudge" | "stop" if reply != "ok" => bail!("unexpected daemon reply: {reply:?}"),
+        "status" => {
+            let _: Status = serde_json::from_str(reply).context("invalid daemon status reply")?;
+        }
+        _ => {}
     }
     Ok(reply.to_string())
 }

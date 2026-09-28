@@ -1,7 +1,8 @@
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
+use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -11,6 +12,7 @@ use crate::process::output_with_timeout;
 use crate::util::truncate;
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Snapshot {
     pub running_sessions: usize,
@@ -25,31 +27,46 @@ impl Snapshot {
 }
 
 pub struct Herdr {
-    bin: OsString,
+    bin: Option<OsString>,
 }
 
 impl Herdr {
     pub fn from_env() -> Self {
-        let bin = env::var_os("HERDR_BIN_PATH").filter(|bin| !bin.is_empty());
-        Self { bin: bin.unwrap_or_else(|| "herdr".into()) }
+        Self { bin: env::var_os("HERDR_BIN_PATH").filter(|bin| !bin.is_empty()) }
+    }
+
+    fn program(&self) -> &OsStr {
+        // Long-lived agent sessions may retain a path to a Herdr executable
+        // that was replaced during an update. Check it on every call.
+        self.bin.as_deref().filter(|bin| Path::new(bin).is_file()).unwrap_or(OsStr::new("herdr"))
     }
 
     /// Every agent in every running local session. A session that cannot be
     /// read is reported in `errors` rather than silently treated as idle.
     pub fn snapshot(&self) -> Snapshot {
-        let sessions = match self.call(&["session", "list", "--json"]).and_then(|out| parse_sessions(&out)) {
-            Ok(sessions) => sessions,
-            Err(error) => {
-                return Snapshot {
-                    running_sessions: 0,
-                    agents: Vec::new(),
-                    errors: vec![format!("session list: {error:#}")],
-                };
-            }
-        };
+        let deadline = Instant::now() + SNAPSHOT_TIMEOUT;
+        let sessions =
+            match self.call(&["session", "list", "--json"], CALL_TIMEOUT).and_then(|out| parse_sessions(&out)) {
+                Ok(sessions) => sessions,
+                Err(error) => {
+                    return Snapshot {
+                        running_sessions: 0,
+                        agents: Vec::new(),
+                        errors: vec![format!("session list: {error:#}")],
+                    };
+                }
+            };
         let mut snapshot = Snapshot { running_sessions: sessions.len(), agents: Vec::new(), errors: Vec::new() };
         for session in sessions {
-            match self.call(&["--session", &session, "agent", "list"]).and_then(|out| parse_agents(&session, &out)) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                snapshot.errors.push("snapshot deadline reached before every session could be read".into());
+                break;
+            }
+            match self
+                .call(&["--session", &session, "agent", "list"], CALL_TIMEOUT.min(remaining))
+                .and_then(|out| parse_agents(&session, &out))
+            {
                 Ok(agents) => snapshot.agents.extend(agents),
                 Err(error) => snapshot.errors.push(format!("session {session}: {error:#}")),
             }
@@ -57,8 +74,8 @@ impl Herdr {
         snapshot
     }
 
-    fn call(&self, args: &[&str]) -> Result<String> {
-        let mut command = Command::new(&self.bin);
+    fn call(&self, args: &[&str], timeout: Duration) -> Result<String> {
+        let mut command = Command::new(self.program());
         command.args(args);
         // The daemon inherits the HERDR_* context of whichever hook started
         // it. Drop it so `--session` alone decides which server answers.
@@ -67,7 +84,7 @@ impl Herdr {
                 command.env_remove(key);
             }
         }
-        let output = output_with_timeout(command, CALL_TIMEOUT)?;
+        let output = output_with_timeout(command, timeout)?;
         if !output.status.success() {
             bail!("{}: {}", output.status, String::from_utf8_lossy(&output.stderr).trim());
         }
@@ -134,6 +151,12 @@ fn parse_agents(session: &str, json: &str) -> Result<Vec<Agent>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_removed_herdr_binary_falls_back_to_path() {
+        let herdr = Herdr { bin: Some("/not/a/real/herdr (deleted)".into()) };
+        assert_eq!(herdr.program(), OsStr::new("herdr"));
+    }
 
     #[test]
     fn only_running_sessions_are_read() {
