@@ -1,0 +1,54 @@
+id = "herdr-keep-awake"
+name = "Keep Awake"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Keep Windows awake while herdr agents are working (WSL)."
+platforms = ["linux"]
+
+[[build]]
+command = ["cargo", "build", "--release"]
+
+# Startup hooks are one-shot: this starts the detached daemon and exits.
+[[startup]]
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-keep-awake\" startup"]
+
+# Every hook only nudges the daemon (starting it if needed), which then
+# re-reads all agents. Hooks never decide anything, so concurrent or missed
+# events cannot leave the hold in the wrong state.
+[[events]]
+id = "agent-status"
+on = "pane.agent_status_changed"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-keep-awake\" event"]
+
+[[events]]
+id = "agent-detected"
+on = "pane.agent_detected"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-keep-awake\" event"]
+
+[[events]]
+id = "pane-closed"
+on = "pane.closed"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-keep-awake\" event"]
+
+[[events]]
+id = "pane-exited"
+on = "pane.exited"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-keep-awake\" event"]
+
+[[actions]]
+id = "status"
+title = "Keep awake: status"
+command = ["sh", "-c", "exec \"$HERDR_BIN_PATH\" plugin pane open --plugin herdr-keep-awake --entrypoint status --focus"]
+
+[[actions]]
+id = "restart"
+title = "Keep awake: restart daemon"
+command = ["sh", "-c", "exec \"$HERDR_PLUGIN_ROOT/target/release/herdr-keep-awake\" restart"]
+
+[[panes]]
+id = "status"
+title = "Keep awake"
+placement = "popup"
+width = 100
+height = 30
+command = ["sh", "-c", "bin=\"$HERDR_PLUGIN_ROOT/target/release/herdr-keep-awake\"; \"$bin\" status; echo; \"$bin\" log 12; printf '\\nPress Enter to close'; read _"]
