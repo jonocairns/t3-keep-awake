@@ -129,6 +129,7 @@ class InstallerTests(unittest.TestCase):
         self.assertTrue(os.access(self.installed, os.X_OK))
         self.assertEqual(old.read_text(), "original checkout binary\n")
         self.assertIn("ExecStart=%h/.local/bin/t3-keep-awake daemon", self.unit.read_text())
+        self.assertIn("KillMode=mixed", self.unit.read_text())
         urls = [part for event in self.events() if isinstance(event, list)
                 and event[0] == "curl" for part in event if part.startswith("https://")]
         self.assertEqual(len(urls), 3)
