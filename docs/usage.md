@@ -128,7 +128,9 @@ The Windows keeper uses `SetThreadExecutionState` from one long-lived
 PowerShell process. It releases when stdin closes, the process exits, or a
 heartbeat is missing for 60 seconds. Keeper failures retry with bounded backoff.
 The daemon resolves WSL's init interop socket for each Windows invocation, so it
-does not need a terminal's `WSL_INTEROP` environment.
+does not need a terminal's `WSL_INTEROP` environment. It looks for
+`powershell.exe` on `PATH`, then on each mounted Windows drive, so the service
+does not need the terminal's Windows `PATH` either.
 
 Only this configured WSL server is watched. Work hosted on another machine does
 not need to keep this Windows host awake.

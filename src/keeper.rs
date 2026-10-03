@@ -1,6 +1,7 @@
 use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
+use std::iter;
 use std::os::unix::fs::FileTypeExt;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
@@ -14,7 +15,8 @@ use crate::process::output_with_timeout;
 
 const KEEPER_SCRIPT: &str = include_str!("keeper.ps1");
 const PROBE_SCRIPT: &str = include_str!("probe.ps1");
-const POWERSHELL_FALLBACK: &str = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
+/// Relative to a Windows drive root.
+const POWERSHELL: &str = "Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
 
 // SetThreadExecutionState flags.
 const ES_CONTINUOUS: u32 = 0x8000_0000;
@@ -60,7 +62,33 @@ fn powershell(script: &str) -> Result<Command> {
 fn find_powershell() -> Option<PathBuf> {
     let on_path = env::var_os("PATH")
         .and_then(|path| env::split_paths(&path).map(|dir| dir.join("powershell.exe")).find(|exe| exe.is_file()));
-    on_path.or_else(|| Some(PathBuf::from(POWERSHELL_FALLBACK)).filter(|exe| exe.is_file()))
+    // User services do not inherit WSL's Windows PATH. Windows is usually C:
+    // under /mnt, but the drive letter and automount root can differ.
+    on_path.or_else(|| {
+        let mounts = fs::read_to_string("/proc/self/mounts").unwrap_or_default();
+        iter::once(PathBuf::from("/mnt/c"))
+            .chain(windows_drives(&mounts))
+            .map(|drive| drive.join(POWERSHELL))
+            .find(|exe| exe.is_file())
+    })
+}
+
+/// Mount points of whole Windows drives, whose source WSL lists as `C:\`.
+fn windows_drives(mounts: &str) -> Vec<PathBuf> {
+    mounts
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace().map(unescape);
+            let (source, target) = (fields.next()?, fields.next()?);
+            let drive = source.strip_suffix('\\').unwrap_or(&source).as_bytes();
+            matches!(drive, [letter, b':'] if letter.is_ascii_alphabetic()).then(|| PathBuf::from(target))
+        })
+        .collect()
+}
+
+/// Undoes the octal escapes /proc/mounts uses for whitespace and backslashes.
+fn unescape(field: &str) -> String {
+    field.replace("\\040", " ").replace("\\011", "\t").replace("\\012", "\n").replace("\\134", "\\")
 }
 
 /// `-EncodedCommand` takes base64 of UTF-16LE. Passing the script inline
@@ -252,6 +280,19 @@ mod tests {
         assert_eq!(base64(b"fo"), "Zm8=");
         assert_eq!(base64(b"foo"), "Zm9v");
         assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn windows_drives_are_found_wherever_wsl_mounts_them() {
+        let mounts = r"
+            drivers /usr/lib/wsl/drivers 9p ro,nosuid,nodev,noatime,aname=drivers 0 0
+            C:\134 /mnt/c 9p rw,noatime,aname=drvfs;path=C:\;uid=1000 0 0
+            D:\134 /win\040drives/d 9p rw,noatime,aname=drvfs;path=D:\;uid=1000 0 0
+            C:\134Program\040Files\134Docker /Docker/host 9p rw,noatime,aname=drvfs 0 0
+            E: /e drvfs rw,noatime 0 0
+        ";
+        let drives = windows_drives(mounts);
+        assert_eq!(drives, [PathBuf::from("/mnt/c"), PathBuf::from("/win drives/d"), PathBuf::from("/e")]);
     }
 
     #[test]
