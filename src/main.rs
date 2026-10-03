@@ -2,12 +2,12 @@ mod client;
 mod config;
 mod daemon;
 mod decide;
-mod herdr;
 mod keeper;
 mod log;
 mod paths;
 mod process;
 mod status;
+mod t3;
 mod util;
 
 use std::process::ExitCode;
@@ -15,9 +15,9 @@ use std::process::ExitCode;
 use anyhow::{Result, anyhow};
 
 const USAGE: &str = "\
-herdr-keep-awake: keep Windows awake while herdr agents are working (WSL)
+t3-keep-awake: keep Windows awake while T3 Code threads are working (WSL)
 
-Usage: herdr-keep-awake <command>
+Usage: t3-keep-awake <command>
 
 Commands:
   status [--json]  Show whether Windows is being held awake, and why
@@ -25,11 +25,11 @@ Commands:
   probe            Read Windows' system-wide execution state
   restart          Restart the daemon (applies config and binary changes)
   stop             Stop the daemon and release any hold
-  startup, event   herdr hooks: nudge the daemon, starting it if needed
+  start            Start the daemon if needed and refresh thread state
   daemon           Run the daemon in the foreground
 
-Config: ~/.config/herdr-keep-awake/config.toml
-State:  ~/.local/state/herdr-keep-awake/
+Config: ~/.config/t3-keep-awake/config.toml
+State:  ~/.local/state/t3-keep-awake/
 ";
 
 fn main() -> ExitCode {
@@ -37,7 +37,7 @@ fn main() -> ExitCode {
     match run(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("herdr-keep-awake: {error:#}");
+            eprintln!("t3-keep-awake: {error:#}");
             ExitCode::FAILURE
         }
     }
@@ -46,7 +46,7 @@ fn main() -> ExitCode {
 fn run(args: &[String]) -> Result<()> {
     let flag = |name: &str| args.iter().skip(1).any(|arg| arg == name);
     match args.first().map(String::as_str) {
-        Some("startup" | "event") => client::nudge(),
+        Some("start") => client::nudge(),
         Some("daemon") => daemon::run(),
         Some("status") => client::status(flag("--json")),
         Some("log") => {

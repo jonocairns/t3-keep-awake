@@ -4,9 +4,9 @@
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-Add-Type -Namespace HerdrKeepAwake -Name Probe -MemberDefinition '[DllImport("powrprof.dll")] public static extern uint CallNtPowerInformation(int level, IntPtr inBuf, uint inLen, out uint outBuf, uint outLen);'
+Add-Type -Namespace T3KeepAwake -Name Probe -MemberDefinition '[DllImport("powrprof.dll")] public static extern uint CallNtPowerInformation(int level, IntPtr inBuf, uint inLen, out uint outBuf, uint outLen);'
 
 $state = [uint32]0
 # 16 = SystemExecutionState
-$rc = [HerdrKeepAwake.Probe]::CallNtPowerInformation(16, [IntPtr]::Zero, 0, [ref]$state, 4)
+$rc = [T3KeepAwake.Probe]::CallNtPowerInformation(16, [IntPtr]::Zero, 0, [ref]$state, 4)
 [Console]::Out.WriteLine("state $rc $state")

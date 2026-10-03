@@ -4,17 +4,17 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-/// The daemon and every client share one fixed directory, so a herdr hook,
-/// a manual CLI call, and the daemon always agree on the socket and lock.
+/// The daemon and every client share one fixed directory, so a manual CLI
+/// call, the service, and the daemon always agree on the socket and lock.
 pub struct Paths {
     dir: PathBuf,
 }
 
 impl Paths {
     pub fn resolve() -> Result<Self> {
-        let dir = match env::var_os("HERDR_KEEP_AWAKE_STATE_DIR") {
+        let dir = match env::var_os("T3_KEEP_AWAKE_STATE_DIR") {
             Some(dir) => PathBuf::from(dir),
-            None => xdg_dir("XDG_STATE_HOME", ".local/state")?.join("herdr-keep-awake"),
+            None => xdg_dir("XDG_STATE_HOME", ".local/state")?.join("t3-keep-awake"),
         };
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
         Ok(Self { dir })
@@ -34,10 +34,14 @@ impl Paths {
 }
 
 pub fn config_file() -> Result<PathBuf> {
-    match env::var_os("HERDR_KEEP_AWAKE_CONFIG") {
+    match env::var_os("T3_KEEP_AWAKE_CONFIG") {
         Some(path) => Ok(PathBuf::from(path)),
-        None => Ok(xdg_dir("XDG_CONFIG_HOME", ".config")?.join("herdr-keep-awake/config.toml")),
+        None => Ok(xdg_dir("XDG_CONFIG_HOME", ".config")?.join("t3-keep-awake/config.toml")),
     }
+}
+
+pub fn service_file() -> Result<PathBuf> {
+    Ok(xdg_dir("XDG_CONFIG_HOME", ".config")?.join("systemd/user/t3-keep-awake.service"))
 }
 
 fn xdg_dir(var: &str, fallback: &str) -> Result<PathBuf> {

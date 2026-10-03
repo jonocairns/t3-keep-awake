@@ -15,9 +15,9 @@ pub struct Status {
     pub active: Vec<String>,
     pub stale: Vec<String>,
     pub keeper: Option<KeeperStatus>,
-    pub running_sessions: usize,
+    pub running_servers: usize,
     pub last_poll_secs_ago: u64,
-    pub herdr_errors: Vec<String>,
+    pub t3_errors: Vec<String>,
     pub keeper_failures: u32,
     pub retry_in_secs: Option<u64>,
 }
@@ -65,11 +65,11 @@ impl Status {
         }
         let _ = writeln!(
             out,
-            "herdr    {} running session(s), polled {} ago",
-            self.running_sessions,
+            "T3       {} live server(s), polled {} ago",
+            self.running_servers,
             secs(self.last_poll_secs_ago)
         );
-        list(&mut out, "errors", &self.herdr_errors);
+        list(&mut out, "errors", &self.t3_errors);
         let _ = writeln!(out, "daemon   pid {}, up {}", self.daemon_pid, secs(self.uptime_secs));
         out
     }

@@ -13,15 +13,15 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{Config, MAX_SNAPSHOT_AGE};
 use crate::decide::{Decision, Tracker};
-use crate::herdr::Herdr;
 use crate::keeper::{self, Keeper, Line, Phase};
 use crate::log::Log;
 use crate::paths::{Paths, config_file};
 use crate::status::{KeeperStatus, Status};
+use crate::t3::T3;
 use crate::util::fmt_duration;
 
 const TICK: Duration = Duration::from_millis(500);
-/// A burst of hook nudges costs at most one herdr read per second.
+/// Manual refresh requests cost at most one T3 read per second.
 const NUDGE_DEBOUNCE: Duration = Duration::from_secs(1);
 /// powershell.exe cold starts take a few seconds; far longer means it is wedged.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
@@ -41,7 +41,7 @@ enum Msg {
 
 pub fn run() -> Result<()> {
     let paths = Paths::resolve()?;
-    // Hooks race to start the daemon; the lock picks one winner and the rest leave quietly.
+    // Clients race to start the daemon; the lock picks one winner and the rest leave quietly.
     let Some(_lock) = try_lock(&paths.lock())? else {
         return Ok(());
     };
@@ -54,8 +54,8 @@ pub fn run() -> Result<()> {
         }
     };
     if !keeper::supported() {
-        log.line("not starting: powershell.exe not found; herdr-keep-awake needs WSL interop");
-        bail!("powershell.exe not found; herdr-keep-awake needs WSL interop");
+        log.line("not starting: powershell.exe not found; t3-keep-awake needs WSL interop");
+        bail!("powershell.exe not found; t3-keep-awake needs WSL interop");
     }
 
     let socket = paths.socket();
@@ -69,10 +69,10 @@ pub fn run() -> Result<()> {
     log.line(format!("started: pid {}, {config:?}", process::id()));
 
     *status.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
-        Status { daemon_pid: process::id(), reason: "reading herdr".into(), ..Status::default() };
-    let mut daemon = Daemon::new(config, log, tx.clone(), Arc::clone(&status));
+        Status { daemon_pid: process::id(), reason: "reading T3".into(), ..Status::default() };
+    let mut daemon = Daemon::new(config, log, tx.clone(), Arc::clone(&status))?;
     spawn_listener(listener, tx, status);
-    // Serve hooks promptly even when the first herdr snapshot is slow.
+    // Serve clients promptly even when the first T3 snapshot is slow.
     daemon.tick(Instant::now());
     let result = daemon.run(&rx);
     daemon.shutdown();
@@ -148,7 +148,7 @@ enum Step {
 
 struct Daemon {
     config: Config,
-    herdr: Herdr,
+    t3: T3,
     log: Log,
     tx: Sender<Msg>,
     status: Arc<Mutex<Status>>,
@@ -157,8 +157,8 @@ struct Daemon {
     decision: Decision,
     last_poll: Option<Instant>,
     poll_requested: bool,
-    running_sessions: usize,
-    herdr_errors: Vec<String>,
+    running_servers: usize,
+    t3_errors: Vec<String>,
     snapshot_expired: bool,
     keeper: Option<Keeper>,
     generation: u64,
@@ -167,11 +167,12 @@ struct Daemon {
 }
 
 impl Daemon {
-    fn new(config: Config, log: Log, tx: Sender<Msg>, status: Arc<Mutex<Status>>) -> Self {
+    fn new(config: Config, log: Log, tx: Sender<Msg>, status: Arc<Mutex<Status>>) -> Result<Self> {
         let now = Instant::now();
-        Self {
+        let t3 = T3::from_config(&config)?;
+        Ok(Self {
             config,
-            herdr: Herdr::from_env(),
+            t3,
             log,
             tx,
             status,
@@ -180,14 +181,14 @@ impl Daemon {
             decision: Decision::default(),
             last_poll: None,
             poll_requested: true,
-            running_sessions: 0,
-            herdr_errors: Vec::new(),
+            running_servers: 0,
+            t3_errors: Vec::new(),
             snapshot_expired: false,
             keeper: None,
             generation: 0,
             failures: 0,
             retry_at: None,
-        }
+        })
     }
 
     fn run(&mut self, rx: &Receiver<Msg>) -> Result<()> {
@@ -218,7 +219,7 @@ impl Daemon {
         let now = Instant::now();
         let (decision, expired) = current_decision(&self.decision, self.last_poll, now);
         if expired && !self.snapshot_expired {
-            self.log.line("release: herdr snapshot stale");
+            self.log.line("release: T3 snapshot stale");
         }
         self.snapshot_expired = expired;
         self.reconcile(now, decision.hold);
@@ -228,7 +229,7 @@ impl Daemon {
     fn poll_due(&self, now: Instant) -> bool {
         let Some(last) = self.last_poll else { return true };
         let since = now.duration_since(last);
-        let interval = if self.running_sessions == 0 && self.herdr_errors.is_empty() && !self.decision.hold {
+        let interval = if self.running_servers == 0 && self.t3_errors.is_empty() && !self.decision.hold {
             self.config.idle_poll()
         } else {
             self.config.poll()
@@ -237,22 +238,29 @@ impl Daemon {
     }
 
     fn poll(&mut self) {
-        let snapshot = self.herdr.snapshot();
+        let snapshot = self.t3.snapshot();
         let now = Instant::now();
         self.last_poll = Some(now);
         self.poll_requested = false;
-        self.running_sessions = snapshot.running_sessions;
-        if snapshot.errors != self.herdr_errors {
+        self.running_servers = snapshot.running_servers;
+        if snapshot.errors != self.t3_errors {
             for error in &snapshot.errors {
-                self.log.line(format!("herdr: {error}"));
+                self.log.line(format!("T3: {error}"));
             }
             if snapshot.errors.is_empty() {
-                self.log.line("herdr: readable again");
+                self.log.line("T3: readable again");
             }
-            self.herdr_errors = snapshot.errors.clone();
+            self.t3_errors = snapshot.errors.clone();
         }
 
-        let decision = self.tracker.observe(&snapshot.agents, snapshot.complete(), now, &self.config);
+        let decision = if snapshot.running_servers == 0 && snapshot.complete() {
+            // A confirmed stopped or unresponsive server cannot authorize a
+            // grace hold from persisted state, even if the last turn ran.
+            self.tracker = Tracker::default();
+            Decision { reason: "T3 server not running".into(), ..Decision::default() }
+        } else {
+            self.tracker.observe(&snapshot.threads, snapshot.complete(), now, &self.config)
+        };
         if decision.hold != self.decision.hold || (decision.hold && self.snapshot_expired) {
             let verb = if decision.hold { "hold" } else { "release" };
             self.log.line(format!("{verb}: {}", decision.reason));
@@ -430,9 +438,9 @@ impl Daemon {
             active: decision.active.clone(),
             stale: decision.stale.clone(),
             keeper,
-            running_sessions: self.running_sessions,
+            running_servers: self.running_servers,
             last_poll_secs_ago: self.last_poll.map_or(0, |at| now.duration_since(at).as_secs()),
-            herdr_errors: self.herdr_errors.clone(),
+            t3_errors: self.t3_errors.clone(),
             keeper_failures: self.failures,
             retry_in_secs: self.retry_at.filter(|at| *at > now).map(|at| at.duration_since(now).as_secs()),
         };
@@ -465,7 +473,7 @@ impl Daemon {
 fn current_decision(decision: &Decision, last_poll: Option<Instant>, now: Instant) -> (Decision, bool) {
     let expired = decision.hold && last_poll.is_some_and(|at| now.duration_since(at) >= MAX_SNAPSHOT_AGE);
     if expired {
-        (Decision { hold: false, reason: "herdr snapshot stale".into(), ..Decision::default() }, true)
+        (Decision { hold: false, reason: "T3 snapshot stale".into(), ..Decision::default() }, true)
     } else {
         (decision.clone(), false)
     }
@@ -480,14 +488,14 @@ mod tests {
         let polled = Instant::now();
         let working = Decision {
             hold: true,
-            reason: "1 agent working".into(),
-            active: vec!["agent".into()],
+            reason: "1 thread working".into(),
+            active: vec!["thread".into()],
             ..Decision::default()
         };
         assert!(current_decision(&working, Some(polled), polled + MAX_SNAPSHOT_AGE - Duration::from_secs(1)).0.hold);
         let (decision, expired) = current_decision(&working, Some(polled), polled + MAX_SNAPSHOT_AGE);
         assert!(expired);
         assert!(!decision.hold);
-        assert_eq!(decision.reason, "herdr snapshot stale");
+        assert_eq!(decision.reason, "T3 snapshot stale");
     }
 }

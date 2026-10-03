@@ -11,7 +11,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::daemon::try_lock;
 use crate::log;
-use crate::paths::Paths;
+use crate::paths::{Paths, service_file};
+use crate::process::output_with_timeout;
 use crate::status::Status;
 
 const START_WAIT: Duration = Duration::from_secs(5);
@@ -40,10 +41,12 @@ fn request(paths: &Paths, command: &str) -> Result<String> {
     Ok(reply.to_string())
 }
 
-/// The startup hook and every event hook: poke the daemon, starting it if
-/// it is not running. This is what makes the daemon self-healing.
+/// Refresh the daemon, starting it if it is not running.
 pub fn nudge() -> Result<()> {
     let paths = Paths::resolve()?;
+    if service_action("start")? {
+        return wait_for_daemon(&paths);
+    }
     if request(&paths, "nudge").is_ok() {
         return Ok(());
     }
@@ -65,6 +68,10 @@ pub fn status(json: bool) -> Result<()> {
 
 pub fn stop() -> Result<()> {
     let paths = Paths::resolve()?;
+    if service_action("stop")? {
+        println!("stopped");
+        return Ok(());
+    }
     if stop_daemon(&paths)? {
         println!("stopped");
     } else {
@@ -75,6 +82,11 @@ pub fn stop() -> Result<()> {
 
 pub fn restart() -> Result<()> {
     let paths = Paths::resolve()?;
+    if service_action("restart")? {
+        wait_for_daemon(&paths)?;
+        println!("started");
+        return Ok(());
+    }
     stop_daemon(&paths)?;
     start(&paths)?;
     println!("started");
@@ -104,11 +116,31 @@ fn stop_daemon(paths: &Paths) -> Result<bool> {
 
 fn start(paths: &Paths) -> Result<()> {
     spawn_daemon(paths)?;
+    wait_for_daemon(paths)
+}
+
+fn wait_for_daemon(paths: &Paths) -> Result<()> {
     if !wait_until(START_WAIT, || request(paths, "nudge").is_ok()) {
         let tail = log::tail(&paths.log(), 5).unwrap_or_default().join("\n");
         bail!("daemon did not come up; last log lines:\n{tail}");
     }
     Ok(())
+}
+
+/// Installed lifecycle commands go through systemd so a restart cannot leave
+/// the replacement daemon outside its supervisor. Isolated/manual state dirs
+/// use the socket controller instead and never affect the installed service.
+fn service_action(action: &str) -> Result<bool> {
+    if env::var_os("T3_KEEP_AWAKE_STATE_DIR").is_some() || !service_file()?.exists() {
+        return Ok(false);
+    }
+    let mut command = Command::new("systemctl");
+    command.args(["--user", action, "t3-keep-awake.service"]);
+    let output = output_with_timeout(command, Duration::from_secs(20))?;
+    if !output.status.success() {
+        bail!("systemctl {action}: {}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(true)
 }
 
 fn spawn_daemon(paths: &Paths) -> Result<()> {
@@ -120,7 +152,7 @@ fn spawn_daemon(paths: &Paths) -> Result<()> {
     let mut command = Command::new(env::current_exe().context("locating own binary")?);
     command.arg("daemon").stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
     // SAFETY: setsid is async-signal-safe. A new session detaches the daemon
-    // from the hook, so herdr cleaning up the hook never takes it along.
+    // from the CLI, so terminal teardown does not take it along.
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() == -1 {

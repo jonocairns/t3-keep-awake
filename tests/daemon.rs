@@ -1,74 +1,106 @@
-//! End-to-end tests of the real binary against a fake `herdr` and a fake
-//! keeper that speaks the keeper protocol. Windows itself is out of scope;
-//! `herdr-keep-awake probe` covers that on a real machine.
+//! Drive the real binary against T3's SQLite projections and a live HTTP
+//! listener, using a fake keeper so tests never change Windows power state.
 
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, TcpListener};
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rusqlite::Connection;
 use serde_json::Value;
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-keep-awake");
-
-const FAKE_HERDR: &str = r#"#!/bin/sh
-if [ "$1 $2 $3" = "session list --json" ]; then exec cat "$FAKE_DIR/sessions.json"; fi
-if [ "$1" = "--session" ] && [ "$3 $4" = "agent list" ]; then exec cat "$FAKE_DIR/agents-$2.json"; fi
-echo "fake herdr: unexpected args: $*" >&2
-exit 2
-"#;
-
+const BIN: &str = env!("CARGO_BIN_EXE_t3-keep-awake");
+const STARTED_AT: &str = "2026-10-03T09:00:00.000Z";
 const FAKE_KEEPER: &str = r#"#!/bin/sh
 echo "start $$" >> "$FAKE_DIR/keeper.log"
 echo "holding $$"
 while IFS= read -r line; do echo pong; done
-# Record the exit first: with the daemon dead, the next write raises SIGPIPE.
-# keeper.ps1 likewise releases before it says so.
+# Release before writing to a possibly closed stdout.
 echo "exit $$" >> "$FAKE_DIR/keeper.log"
 echo "released stdin-closed"
 "#;
-
-const CONFIG: &str = "poll_secs = 1\nidle_poll_secs = 2\ngrace_secs = 2\nheartbeat_secs = 1\nkeeper_timeout_secs = 3\n";
+const CONFIG: &str = "poll_secs = 1\nidle_poll_secs = 1\ngrace_secs = 2\nheartbeat_secs = 1\nkeeper_timeout_secs = 3\n";
 
 struct Harness {
     dir: PathBuf,
+    database: Connection,
+    port: u16,
+    respond: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
+    server: Option<thread::JoinHandle<()>>,
 }
 
 impl Harness {
     fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("hka-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = std::env::temp_dir().join(format!("tka-{name}-{}", std::process::id()));
         fs::create_dir_all(dir.join("state")).unwrap();
-        write_executable(&dir.join("herdr"), FAKE_HERDR);
-        write_executable(&dir.join("keeper"), FAKE_KEEPER);
+        fs::create_dir_all(dir.join("userdata")).unwrap();
+        fs::write(dir.join("keeper"), FAKE_KEEPER).unwrap();
+        fs::set_permissions(dir.join("keeper"), fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(dir.join("config.toml"), CONFIG).unwrap();
-        let harness = Self { dir };
-        harness.set_session_running(true);
-        harness.set_agents(&[]);
+        let database = Connection::open(dir.join("userdata/state.sqlite")).unwrap();
+        database.pragma_update(None, "journal_mode", "WAL").unwrap();
+        database.execute_batch(include_str!("fixtures/schema.sql")).unwrap();
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let respond = Arc::new(AtomicBool::new(true));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_respond = Arc::clone(&respond);
+        let server_shutdown = Arc::clone(&shutdown);
+        let server = thread::spawn(move || {
+            while !server_shutdown.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+                        stream.set_write_timeout(Some(Duration::from_millis(200))).unwrap();
+                        let mut request = [0; 512];
+                        let _ = stream.read(&mut request);
+                        if server_respond.load(Ordering::SeqCst) {
+                            let _ =
+                                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("test server: {error}"),
+                }
+            }
+        });
+        let harness = Self { dir, database, port, respond, shutdown, server: Some(server) };
+        harness.set_server_running(true);
         harness
     }
 
-    fn set_session_running(&self, running: bool) {
-        let sessions = if running {
-            r#"{"sessions":[{"default":true,"name":"default","running":true}]}"#
-        } else {
-            r#"{"sessions":[]}"#
-        };
-        let tmp = self.dir.join("sessions.tmp");
-        fs::write(&tmp, sessions).unwrap();
-        fs::rename(&tmp, self.dir.join("sessions.json")).unwrap();
+    fn set_server_running(&self, running: bool) {
+        let path = self.dir.join("userdata/server-runtime.json");
+        if !running {
+            fs::remove_file(path).unwrap();
+            return;
+        }
+        let runtime = serde_json::json!({
+            "version": 1, "pid": std::process::id(), "port": self.port, "startedAt": STARTED_AT
+        });
+        fs::write(path.with_extension("tmp"), runtime.to_string()).unwrap();
+        fs::rename(path.with_extension("tmp"), path).unwrap();
     }
 
     fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(BIN);
         command
             .args(args)
-            .env("HERDR_KEEP_AWAKE_STATE_DIR", self.dir.join("state"))
-            .env("HERDR_KEEP_AWAKE_CONFIG", self.dir.join("config.toml"))
-            .env("HERDR_KEEP_AWAKE_KEEPER", self.dir.join("keeper"))
-            .env("HERDR_BIN_PATH", self.dir.join("herdr"))
+            .env("T3_KEEP_AWAKE_STATE_DIR", self.dir.join("state"))
+            .env("T3_KEEP_AWAKE_CONFIG", self.dir.join("config.toml"))
+            .env("T3_KEEP_AWAKE_KEEPER", self.dir.join("keeper"))
+            .env("T3_KEEP_AWAKE_DATA_DIR", self.dir.join("userdata"))
             .env("FAKE_DIR", &self.dir);
         command
     }
@@ -77,7 +109,7 @@ impl Harness {
         let output = self.command(args).output().unwrap();
         assert!(
             output.status.success(),
-            "`{}` failed: {}{}",
+            "{}: {}{}",
             args.join(" "),
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
@@ -85,20 +117,43 @@ impl Harness {
         output
     }
 
-    /// `(pane, status)` pairs; `seq` is fixed per pane so a stretch is stable.
-    fn set_agents(&self, agents: &[(&str, &str)]) {
-        let agents: Vec<Value> = agents
-            .iter()
-            .enumerate()
-            .map(|(i, (pane, status))| {
-                serde_json::json!({"agent": "claude", "pane_id": pane, "agent_status": status, "state_change_seq": i})
-            })
-            .collect();
-        let json = serde_json::json!({"id": "cli:agent:list", "result": {"agents": agents}});
-        // Write then rename, so the fake never serves a half-written file.
-        let tmp = self.dir.join("agents.tmp");
-        fs::write(&tmp, json.to_string()).unwrap();
-        fs::rename(&tmp, self.dir.join("agents-default.json")).unwrap();
+    fn set_threads(&self, threads: &[(&str, &str)]) {
+        let transaction = self.database.unchecked_transaction().unwrap();
+        transaction
+            .execute_batch(
+                "DELETE FROM projection_threads; DELETE FROM projection_thread_sessions;
+             DELETE FROM provider_session_runtime; DELETE FROM projection_turns;",
+            )
+            .unwrap();
+        for (id, state) in threads {
+            let turn = format!("turn-{id}");
+            let running = matches!(*state, "working" | "blocked");
+            transaction
+                .execute(
+                    "INSERT INTO projection_threads(thread_id,title,pending_approval_count) VALUES (?1,?1,?2)",
+                    rusqlite::params![id, *state == "blocked"],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO projection_thread_sessions VALUES (?1,?2,?3)",
+                    rusqlite::params![id, if running { "running" } else { "ready" }, turn],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO provider_session_runtime VALUES (?1,'codex','running',?2,?3)",
+                    rusqlite::params![id, STARTED_AT, serde_json::json!({"activeTurnId":turn}).to_string()],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO projection_turns(thread_id,turn_id,state) VALUES (?1,?2,?3)",
+                    rusqlite::params![id, turn, if running { "running" } else { "completed" }],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
     }
 
     fn status(&self) -> Option<Value> {
@@ -112,26 +167,22 @@ impl Harness {
             if let Some(status) = self.status().filter(|status| ready(status)) {
                 return status;
             }
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for {what}; last status: {:?}\nlog:\n{}",
-                self.status(),
-                self.log()
-            );
-            thread::sleep(Duration::from_millis(100));
-        }
-    }
-
-    fn wait_for_keeper_log(&self, needle: &str) {
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while !self.keeper_log().contains(needle) {
-            assert!(Instant::now() < deadline, "keeper log never contained {needle:?}:\n{}", self.keeper_log());
+            assert!(Instant::now() < deadline, "waiting for {what}; status: {:?}\nlog:\n{}", self.status(), self.log());
             thread::sleep(Duration::from_millis(100));
         }
     }
 
     fn keeper_log(&self) -> String {
         fs::read_to_string(self.dir.join("keeper.log")).unwrap_or_default()
+    }
+
+    fn wait_for_keeper_exit(&self, pid: u64) {
+        let needle = format!("exit {pid}");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !self.keeper_log().contains(&needle) {
+            assert!(Instant::now() < deadline, "keeper did not release: {}", self.keeper_log());
+            thread::sleep(Duration::from_millis(100));
+        }
     }
 
     fn log(&self) -> String {
@@ -142,13 +193,12 @@ impl Harness {
 impl Drop for Harness {
     fn drop(&mut self) {
         let _ = self.command(&["stop"]).output();
+        self.shutdown.store(true, Ordering::SeqCst);
+        if let Some(server) = self.server.take() {
+            let _ = server.join();
+        }
         let _ = fs::remove_dir_all(&self.dir);
     }
-}
-
-fn write_executable(path: &Path, content: &str) {
-    fs::write(path, content).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 fn holding(status: &Value) -> bool {
@@ -164,123 +214,143 @@ fn kill(pid: u64) {
 }
 
 #[test]
-fn holds_while_any_agent_works_and_releases_after_the_grace_period() {
+fn holds_for_running_turns_and_releases_when_the_last_turn_finishes() {
     let h = Harness::new("hold");
-    h.set_agents(&[("w1:p1", "idle"), ("w1:p2", "working")]);
-    h.run(&["event"]);
-    let status = h.wait_for("the hold", holding);
-    assert_eq!(status["reason"], "1 agent working");
-    assert_eq!(status["active"][0], "default/w1:p2 claude");
-
-    h.set_agents(&[("w1:p1", "idle"), ("w1:p2", "done")]);
-    h.run(&["event"]);
-    let status = h.wait_for("the grace period", |s| s["reason"].as_str().unwrap().contains("grace period"));
-    assert_eq!(status["hold"], true);
-
-    h.wait_for("the release", |s| s["hold"] == false && s["keeper"].is_null());
+    h.set_threads(&[("thread-1", "working"), ("thread-2", "working")]);
+    h.run(&["start"]);
+    let status = h.wait_for("both turns", |s| holding(s) && s["active"].as_array().unwrap().len() == 2);
     let pid = keeper_pid(&status);
-    h.wait_for_keeper_log(&format!("exit {pid}"));
+    h.set_threads(&[("thread-1", "done"), ("thread-2", "working")]);
+    h.wait_for("the remaining turn", |s| holding(s) && s["active"].as_array().unwrap().len() == 1);
+    h.set_threads(&[("thread-1", "done"), ("thread-2", "done")]);
+    h.wait_for("the grace period", |s| s["hold"] == true && s["reason"].as_str().unwrap().contains("grace period"));
+    h.wait_for("the release", |s| s["hold"] == false && s["keeper"].is_null());
+    h.wait_for_keeper_exit(pid);
+}
+
+#[test]
+fn an_open_idle_t3_process_does_not_keep_windows_awake() {
+    let h = Harness::new("idle");
+    h.set_threads(&[("idle-thread", "idle")]);
+    h.run(&["start"]);
+    h.wait_for("the idle server", |s| s["running_servers"] == 1 && s["hold"] == false);
+    assert!(h.keeper_log().is_empty());
+}
+
+#[test]
+fn permission_prompts_do_not_hold_by_default_and_can_be_enabled() {
+    let h = Harness::new("blocked");
+    h.set_threads(&[("blocked-thread", "blocked")]);
+    h.run(&["start"]);
+    h.wait_for("the blocked turn", |s| s["running_servers"] == 1 && s["hold"] == false);
+    fs::write(h.dir.join("config.toml"), format!("{CONFIG}hold_blocked = true\n")).unwrap();
+    h.run(&["restart"]);
+    h.wait_for("the optional blocked hold", holding);
 }
 
 #[test]
 fn a_keeper_that_dies_is_replaced() {
     let h = Harness::new("respawn");
-    h.set_agents(&[("w1:p1", "working")]);
-    h.run(&["event"]);
+    h.set_threads(&[("thread", "working")]);
+    h.run(&["start"]);
     let first = keeper_pid(&h.wait_for("the first keeper", holding));
-
     kill(first);
-    let second = h.wait_for("a replacement keeper", |s| holding(s) && keeper_pid(s) != first);
-    assert_eq!(second["keeper_failures"], 1);
+    let next = h.wait_for("the replacement", |s| holding(s) && keeper_pid(s) != first);
+    assert_ne!(keeper_pid(&next), first);
     assert!(h.log().contains("keeper exited unexpectedly"));
 }
 
 #[test]
-fn a_killed_daemon_releases_its_keeper_and_the_next_hook_restarts_it() {
+fn a_killed_daemon_releases_its_keeper_and_start_recovers_it() {
     let h = Harness::new("orphan");
-    h.set_agents(&[("w1:p1", "working")]);
-    h.run(&["event"]);
+    h.set_threads(&[("thread", "working")]);
+    h.run(&["start"]);
     let status = h.wait_for("the hold", holding);
-
     kill(status["daemon_pid"].as_u64().unwrap());
-    // No cleanup ran: the keeper lets go only because its stdin closed.
-    h.wait_for_keeper_log(&format!("exit {}", keeper_pid(&status)));
-
-    h.run(&["event"]);
-    let restarted = h.wait_for("a new daemon holding", holding);
+    h.wait_for_keeper_exit(keeper_pid(&status));
+    h.run(&["start"]);
+    let restarted = h.wait_for("the new daemon", holding);
     assert_ne!(restarted["daemon_pid"], status["daemon_pid"]);
 }
 
 #[test]
-fn concurrent_hooks_start_exactly_one_daemon() {
+fn concurrent_starts_create_exactly_one_controller() {
     let h = Harness::new("race");
-    let hooks: Vec<_> = (0..8).map(|_| h.command(&["event"]).spawn().unwrap()).collect();
-    for mut hook in hooks {
-        assert!(hook.wait().unwrap().success());
+    let clients: Vec<_> = (0..8).map(|_| h.command(&["start"]).spawn().unwrap()).collect();
+    for mut client in clients {
+        assert!(client.wait().unwrap().success());
     }
-    let status = h.wait_for("the first snapshot", |s| s["running_sessions"] == 1);
-    assert_ne!(status["daemon_pid"], 0);
-    assert_eq!(status["running_sessions"], 1);
-    assert_eq!(h.log().matches("started: pid").count(), 1, "log:\n{}", h.log());
+    h.wait_for("the first snapshot", |s| s["running_servers"] == 1);
+    assert_eq!(h.log().matches("started: pid").count(), 1);
 }
 
 #[test]
 fn stop_releases_the_hold_and_restart_resumes_it() {
     let h = Harness::new("stop");
-    h.set_agents(&[("w1:p1", "working")]);
-    h.run(&["event"]);
-    let status = h.wait_for("the hold", holding);
-
-    let output = h.run(&["restart"]);
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "started");
-    h.wait_for_keeper_log(&format!("exit {}", keeper_pid(&status)));
-    let restarted = h.wait_for("the hold after restart", holding);
-    assert_ne!(restarted["daemon_pid"], status["daemon_pid"]);
-
-    let output = h.run(&["stop"]);
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "stopped");
-    h.wait_for_keeper_log(&format!("exit {}", keeper_pid(&restarted)));
+    h.set_threads(&[("thread", "working")]);
+    h.run(&["start"]);
+    let first = h.wait_for("the hold", holding);
+    h.run(&["restart"]);
+    h.wait_for_keeper_exit(keeper_pid(&first));
+    let next = h.wait_for("the hold after restart", holding);
+    assert_ne!(next["daemon_pid"], first["daemon_pid"]);
+    h.run(&["stop"]);
+    h.wait_for_keeper_exit(keeper_pid(&next));
     assert!(h.status().is_none());
 }
 
 #[test]
-fn an_unreadable_herdr_releases_after_the_grace_period() {
-    let h = Harness::new("broken");
-    h.set_agents(&[("w1:p1", "working")]);
-    h.run(&["event"]);
+fn an_incompatible_database_releases_and_recovers_without_restart() {
+    let h = Harness::new("schema");
+    h.set_threads(&[("thread", "working")]);
+    h.run(&["start"]);
     h.wait_for("the hold", holding);
-
-    fs::write(h.dir.join("agents-default.json"), "not json").unwrap();
-    h.wait_for("the release", |s| s["hold"] == false && s["reason"] == "herdr unreadable");
-    assert!(h.log().contains("herdr: session default: parsing agent list"));
+    h.database.execute_batch("ALTER TABLE projection_threads RENAME TO incompatible_threads;").unwrap();
+    h.wait_for("the release", |s| s["hold"] == false && s["reason"] == "T3 unreadable");
+    assert!(h.log().contains("database schema may have changed"));
+    h.database.execute_batch("ALTER TABLE incompatible_threads RENAME TO projection_threads;").unwrap();
+    h.wait_for("the recovered hold", holding);
 }
 
 #[test]
-fn an_idle_controller_discovers_work_without_another_hook() {
-    let h = Harness::new("idle-recovery");
-    h.set_session_running(false);
-    h.run(&["startup"]);
-    let idle = h.wait_for("no running session", |s| s["running_sessions"] == 0 && s["reason"] == "no agents working");
-    thread::sleep(Duration::from_secs(3));
-    assert_eq!(h.status().unwrap()["daemon_pid"], idle["daemon_pid"]);
-
-    h.set_agents(&[("w1:p1", "working")]);
-    h.set_session_running(true);
-    let holding = h.wait_for("work found by the idle poll", holding);
-    assert_eq!(holding["daemon_pid"], idle["daemon_pid"]);
+fn the_controller_discovers_a_returning_server_without_hooks() {
+    let h = Harness::new("discovery");
+    h.set_server_running(false);
+    h.set_threads(&[("thread", "working")]);
+    h.run(&["start"]);
+    let idle = h.wait_for("the absent server", |s| s["reason"] == "T3 server not running");
+    h.set_server_running(true);
+    let active = h.wait_for("the discovered turn", holding);
+    assert_eq!(idle["daemon_pid"], active["daemon_pid"]);
 }
 
 #[test]
-fn a_broken_session_list_recovers_without_another_hook() {
-    let h = Harness::new("list-recovery");
-    h.set_agents(&[("w1:p1", "working")]);
-    h.run(&["startup"]);
-    let initial = h.wait_for("the initial hold", holding);
+fn a_stopped_or_unresponsive_server_cannot_hold_using_persisted_running_turns() {
+    let h = Harness::new("liveness");
+    h.set_threads(&[("thread", "working")]);
+    h.run(&["start"]);
+    let first = h.wait_for("the initial hold", holding);
+    h.respond.store(false, Ordering::SeqCst);
+    h.wait_for("release while the socket still exists", |s| {
+        s["hold"] == false && s["reason"] == "T3 server not running"
+    });
+    h.wait_for_keeper_exit(keeper_pid(&first));
+    h.respond.store(true, Ordering::SeqCst);
+    h.wait_for("the recovered server", holding);
+    h.set_server_running(false);
+    h.wait_for("the stopped server", |s| s["hold"] == false && s["reason"] == "T3 server not running");
+}
 
-    fs::write(h.dir.join("sessions.json"), "not json").unwrap();
-    h.wait_for("release after unreadable herdr", |s| s["hold"] == false && s["reason"] == "herdr unreadable");
-
-    h.set_session_running(true);
-    let recovered = h.wait_for("hold after herdr recovers", holding);
-    assert_eq!(recovered["daemon_pid"], initial["daemon_pid"]);
+#[test]
+fn a_runtime_pid_that_does_not_own_the_listener_is_ignored() {
+    let h = Harness::new("pid");
+    h.set_threads(&[("thread", "working")]);
+    let mut unrelated = Command::new("sleep").arg("20").spawn().unwrap();
+    let runtime = serde_json::json!({"version": 1, "pid": unrelated.id(), "port": h.port, "startedAt": STARTED_AT});
+    fs::write(h.dir.join("userdata/server-runtime.json"), runtime.to_string()).unwrap();
+    h.run(&["start"]);
+    h.wait_for("the rejected runtime", |s| s["hold"] == false && s["reason"] == "T3 server not running");
+    assert!(h.keeper_log().is_empty());
+    unrelated.kill().unwrap();
+    unrelated.wait().unwrap();
 }

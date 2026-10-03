@@ -1,17 +1,20 @@
-Capture new durable conventions, invariants, and recurring pitfalls here when they will help future agents make better decisions.
+Capture durable conventions and recurring pitfalls here when they help future agents.
 
-- After changes run `cargo fmt && cargo clippy --all-targets && cargo test`. Then `./target/release/herdr-keep-awake restart` (after `cargo build --release`) so the live daemon runs the new binary; the old one keeps running otherwise.
-- Keep the daemon level-triggered: hooks only nudge; `decide::Tracker::observe` recomputes the hold from a full snapshot. Don't add logic that depends on seeing a particular event.
-- Use herdr's semantic `agent_status` as the source of truth; inspect `herdr agent explain` when its classification seems wrong instead of inferring activity from process CPU or terminal output here.
-- Keep one controller running while installed. Poll slowly only after a complete zero-session snapshot and once any grace hold has ended; an unreadable session list must keep being retried. Never renew a hold from a snapshot older than 60s.
-- The controller is long-lived, so rotate its log during runtime. Keep the current log inode open when rotating because the keeper's stderr is a cloned handle to it.
-- Keep `poll_secs` below the shared `MAX_SNAPSHOT_AGE` limit so normal polling cannot repeatedly expire and restart the keeper.
-- Fail toward letting Windows sleep. Any new failure path should end in a released hold (grace period at most), never an indefinite one.
-- Windows PowerShell 5.1 pitfalls in `src/keeper.ps1`:
-  - Hex literals `>= 0x80000000` parse as negative Int32 and fail the uint parameter. Pass `SetThreadExecutionState` flags as decimal (filled in from Rust).
-  - `[Console]::In.ReadLineAsync()` blocks, silently defeating the heartbeat timeout. Use `IO.StreamReader([Console]::OpenStandardInput())`.
-  - The keeper must release before writing to stdout: with the daemon gone, the write can fail and end the script.
-- `CallNtPowerInformation(SystemExecutionState)` (`probe`) is system-wide. Other Windows processes briefly set `ES_SYSTEM_REQUIRED` too, so don't treat it as proof of what our keeper did; use keeper replies and process state.
-- `herdr` event hooks inherit the invoking session's `HERDR_*` env. `Herdr::call` strips it and uses `--session` explicitly.
-- `HERDR_BIN_PATH` can contain a stale `... (deleted)` path after herdr updates during a long-running session. Check it before each CLI call and fall back to `herdr` on `PATH`.
-- `revision` in `herdr agent list` barely changes while an agent works, so it can't show liveness. `state_change_seq` changes on every status transition, so `(pane, seq)` identifies one uninterrupted stretch.
+- Base changes on `main` and use conventional commit prefixes.
+- After changes run `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`. Build the release binary, then use `t3-keep-awake restart` so the installed service picks up changes.
+- T3's SQLite projections are an internal interface. Open them read-only, retain WAL visibility, and treat schema changes as errors. Never migrate, repair, or write to T3's database.
+- Count current active AI turns, not the presence of T3 or a provider process. Join the session's active-turn ID to a running turn and matching provider runtime from the current server lifetime.
+- Confirm that the runtime PID owns the listening socket and answers HTTP before trusting persisted running state. A stopped or unresponsive server must release on the next poll.
+- Pending async user questions can coexist with work. They must not hide an otherwise running turn; classify pending permission approvals through the explicit blocked policy.
+- Keep the controller level-triggered: every poll recomputes the hold from a full snapshot. Do not rely on observing one particular event.
+- A read error can preserve an existing hold only through the grace period. Never authorize a hold from a snapshot older than 60 seconds. Bound database waits and HTTP checks.
+- Use stable server and turn identities for stuck timers. Repeated observations must not reset an uninterrupted turn's timer.
+- Keep the installed daemon supervised by its systemd user service. Route CLI start/stop/restart through systemd; isolated state directories use the manual controller for tests.
+- Fail toward letting Windows sleep. New failure paths must release the hold or expire it within a bounded grace period.
+- Rotate logs while running and preserve the current inode when rotating because the keeper's stderr is a cloned file handle.
+- Windows PowerShell 5.1 parses large hexadecimal flags as negative Int32 values; pass decimal uint flags.
+- `[Console]::In.ReadLineAsync()` blocks on PowerShell 5.1. Use a StreamReader over the raw stdin stream so the heartbeat timeout works.
+- Release the Windows request before writing a release message: stdout can be closed after the daemon dies.
+- Systemd services do not inherit a terminal's `WSL_INTEROP`. Resolve WSL's stable init interop socket for each Windows invocation.
+- `CallNtPowerInformation(SystemExecutionState)` is system-wide. Verify this daemon's hold with keeper replies and process state, not the probe alone.
+- Tests use isolated SQLite fixtures, live local HTTP listeners, and fake keepers. They must not touch the installed service, live T3 state, or Windows power settings.

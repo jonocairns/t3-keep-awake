@@ -1,6 +1,7 @@
 use std::env;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::FileTypeExt;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::thread;
@@ -22,7 +23,7 @@ const ES_DISPLAY_REQUIRED: u32 = 0x0000_0002;
 const ES_AWAYMODE_REQUIRED: u32 = 0x0000_0040;
 
 /// Test seam: a program speaking the keeper protocol instead of powershell.exe.
-const FAKE_KEEPER_ENV: &str = "HERDR_KEEP_AWAKE_KEEPER";
+const FAKE_KEEPER_ENV: &str = "T3_KEEP_AWAKE_KEEPER";
 
 pub fn supported() -> bool {
     env::var_os(FAKE_KEEPER_ENV).is_some() || find_powershell().is_some()
@@ -44,8 +45,14 @@ fn keeper_script(config: &Config) -> String {
 }
 
 fn powershell(script: &str) -> Result<Command> {
-    let exe = find_powershell().context("powershell.exe not found; herdr-keep-awake needs WSL interop")?;
+    let exe = find_powershell().context("powershell.exe not found; t3-keep-awake needs WSL interop")?;
     let mut command = Command::new(exe);
+    // User services do not inherit a terminal's WSL_INTEROP. Prefer WSL's
+    // stable init socket, resolving it again for every Windows invocation.
+    let init_socket = PathBuf::from("/run/WSL/1_interop");
+    if fs::metadata(&init_socket).is_ok_and(|metadata| metadata.file_type().is_socket()) {
+        command.env("WSL_INTEROP", init_socket);
+    }
     command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", &encode_command(script)]);
     Ok(command)
 }
@@ -190,6 +197,9 @@ impl Keeper {
 /// Reads Windows' system-wide execution state (every process, not only ours).
 pub fn probe() -> Result<()> {
     let output = output_with_timeout(powershell(PROBE_SCRIPT)?, Duration::from_secs(30))?;
+    if !output.status.success() {
+        bail!("Windows probe failed: {}", String::from_utf8_lossy(&output.stderr).trim());
+    }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let Some(fields) = stdout.lines().find_map(|line| line.trim().strip_prefix("state ")) else {
         bail!("unexpected probe output: {}{}", stdout.trim(), String::from_utf8_lossy(&output.stderr).trim());
@@ -202,7 +212,7 @@ pub fn probe() -> Result<()> {
         bail!("CallNtPowerInformation failed with NTSTATUS 0x{rc:08X}");
     }
     println!("Windows execution state: 0x{state:08X} ({})", describe(state));
-    println!("This is the union of every Windows process's request, not only herdr-keep-awake's.");
+    println!("This is the union of every Windows process's request, not only t3-keep-awake's.");
     Ok(())
 }
 

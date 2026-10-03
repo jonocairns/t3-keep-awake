@@ -9,21 +9,23 @@ use serde::{Deserialize, Serialize};
 /// A working decision is released when its source snapshot reaches this age.
 pub const MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(60);
 
-/// Read once when the daemon starts; `herdr-keep-awake restart` applies edits.
+/// Read once when the daemon starts; `t3-keep-awake restart` applies edits.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// How often herdr is polled when no event arrives.
+    /// T3 Code userdata directory (contains state.sqlite and server-runtime.json).
+    pub t3_data_dir: Option<std::path::PathBuf>,
+    /// How often T3 thread state is polled while its server is running.
     pub poll_secs: u64,
-    /// How often to look for a herdr server when none is running.
+    /// How often to look for a T3 server when none is running.
     pub idle_poll_secs: u64,
-    /// How long the hold outlasts the last working agent. Bridges the gaps
-    /// between turns and tool calls, and covers a briefly unreadable herdr.
+    /// How long the hold outlasts the last working thread. Bridges the gaps
+    /// between turns and tool calls, and covers a briefly unreadable T3 database.
     pub grace_secs: u64,
     /// One uninterrupted working stretch longer than this is treated as a
     /// stuck status and stops counting.
     pub max_working_secs: u64,
-    /// Whether an agent waiting on a permission prompt keeps Windows awake.
+    /// Whether a thread waiting on a permission prompt keeps Windows awake.
     pub hold_blocked: bool,
     /// Keep the display on as well, not just the system.
     pub keep_display_on: bool,
@@ -31,23 +33,20 @@ pub struct Config {
     pub heartbeat_secs: u64,
     /// The keeper releases the hold if it hears nothing for this long.
     pub keeper_timeout_secs: u64,
-    /// Accepted for config compatibility; the controller now stays running.
-    #[serde(skip_serializing)]
-    pub idle_exit_secs: Option<u64>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            poll_secs: 10,
-            idle_poll_secs: 60,
-            grace_secs: 300,
+            t3_data_dir: None,
+            poll_secs: 5,
+            idle_poll_secs: 5,
+            grace_secs: 30,
             max_working_secs: 8 * 60 * 60,
             hold_blocked: false,
             keep_display_on: false,
             heartbeat_secs: 15,
             keeper_timeout_secs: 60,
-            idle_exit_secs: None,
         }
     }
 }
@@ -118,7 +117,7 @@ mod tests {
 
     #[test]
     fn a_missing_file_uses_the_defaults() {
-        let config = Config::load(Path::new("/nonexistent/herdr-keep-awake.toml")).unwrap();
+        let config = Config::load(Path::new("/nonexistent/t3-keep-awake.toml")).unwrap();
         assert_eq!(config, Config::default());
     }
 
@@ -133,11 +132,6 @@ mod tests {
     #[test]
     fn a_misspelled_key_is_rejected() {
         assert!(parse("grace_seconds = 60\n").is_err());
-    }
-
-    #[test]
-    fn the_old_idle_exit_setting_is_accepted_but_ignored() {
-        assert_eq!(parse("idle_exit_secs = 600\n").unwrap().idle_poll_secs, 60);
     }
 
     #[test]
