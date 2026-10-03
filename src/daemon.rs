@@ -257,7 +257,7 @@ impl Daemon {
         let decision = if snapshot.running_servers == 0 && snapshot.complete() {
             // A confirmed stopped or unresponsive server cannot authorize a
             // grace hold from persisted state, even if the last turn ran.
-            self.tracker = Tracker::default();
+            self.tracker.server_offline();
             Decision { reason: "T3 server not running".into(), ..Decision::default() }
         } else {
             self.tracker.observe(&snapshot.threads, snapshot.complete(), now, &self.config)

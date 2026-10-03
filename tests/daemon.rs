@@ -278,6 +278,22 @@ fn a_keeper_that_ignores_release_cannot_block_the_next_hold() {
 }
 
 #[test]
+fn a_server_that_briefly_stops_answering_keeps_its_stuck_timer() {
+    let h = Harness::new("blip");
+    fs::write(h.dir.join("config.toml"), format!("{CONFIG}max_working_secs = 4\n")).unwrap();
+    h.set_threads(&[("thread", "working")]);
+    h.run(&["start"]);
+    h.wait_for("the hold", holding);
+    h.respond.store(false, Ordering::SeqCst);
+    h.wait_for("the unresponsive server", |s| s["reason"] == "T3 server not running");
+    thread::sleep(Duration::from_secs(4));
+    h.respond.store(true, Ordering::SeqCst);
+    let status = h.wait_for("the same server", |s| s["running_servers"] == 1);
+    assert_eq!(status["hold"], false, "{status}");
+    assert!(status["reason"].as_str().unwrap().contains("treated as stuck"), "{status}");
+}
+
+#[test]
 fn a_killed_daemon_releases_its_keeper_and_start_recovers_it() {
     let h = Harness::new("orphan");
     h.set_threads(&[("thread", "working")]);

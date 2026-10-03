@@ -96,6 +96,13 @@ impl Tracker {
         };
         Decision { hold: false, reason, active, stale }
     }
+
+    /// A stopped or unresponsive server cannot authorize a grace hold. Stuck
+    /// timers survive: the same server may answer the next poll, and a
+    /// restarted server's turns have new identities anyway.
+    pub fn server_offline(&mut self) {
+        self.last_active = None;
+    }
 }
 
 #[cfg(test)]
@@ -225,6 +232,19 @@ mod tests {
         let stuck = [thread("a", ThreadStatus::Working, 1)];
         tracker.observe(&stuck, true, t0, &config());
         tracker.observe(&[], false, t0 + secs(10), &config());
+        let decision = tracker.observe(&stuck, true, t0 + secs(3600), &config());
+        assert_eq!(decision.stale, ["a"]);
+    }
+
+    #[test]
+    fn an_offline_server_ends_the_grace_period_but_not_the_stuck_timer() {
+        let t0 = Instant::now();
+        let mut tracker = Tracker::default();
+        let stuck = [thread("a", ThreadStatus::Working, 1)];
+        tracker.observe(&stuck, true, t0, &config());
+        tracker.server_offline();
+        assert!(!tracker.observe(&[], false, t0 + secs(10), &config()).hold);
+
         let decision = tracker.observe(&stuck, true, t0 + secs(3600), &config());
         assert_eq!(decision.stale, ["a"]);
     }
