@@ -144,6 +144,7 @@ enum Step {
     Spawn,
     Ping,
     Kill(&'static str),
+    ForceRelease,
 }
 
 struct Daemon {
@@ -306,7 +307,11 @@ impl Daemon {
         let step = match &self.keeper {
             None if self.retry_at.is_some_and(|at| now < at) => Step::Nothing,
             None => Step::Spawn,
-            // Wanted again mid-release: let it exit, and the next tick spawns a fresh one.
+            // Wanted again mid-release: let it exit, and the next tick spawns a
+            // fresh one. One that ignores stdin closing must not block the hold.
+            Some(Keeper { phase: Phase::Releasing { since }, .. }) if now.duration_since(*since) >= RELEASE_TIMEOUT => {
+                Step::ForceRelease
+            }
             Some(Keeper { phase: Phase::Releasing { .. }, .. }) => Step::Nothing,
             Some(keeper @ Keeper { phase: Phase::Starting, .. }) => {
                 if now.duration_since(keeper.spawned) >= START_TIMEOUT {
@@ -336,6 +341,7 @@ impl Daemon {
                 }
             }
             Step::Kill(why) => self.kill_keeper(now, why),
+            Step::ForceRelease => self.force_release(),
         }
     }
 
@@ -346,11 +352,7 @@ impl Daemon {
             return;
         };
         match keeper.phase {
-            Phase::Releasing { since } if now.duration_since(since) >= RELEASE_TIMEOUT => {
-                keeper.kill();
-                self.keeper = None;
-                self.log.line("released: keeper ignored stdin closing, killed it");
-            }
+            Phase::Releasing { since } if now.duration_since(since) >= RELEASE_TIMEOUT => self.force_release(),
             Phase::Releasing { .. } => {}
             _ => {
                 keeper.release(now);
@@ -375,6 +377,13 @@ impl Daemon {
                 self.keeper = Some(keeper);
             }
             Err(error) => self.record_failure(now, &Phase::Starting, &format!("{error:#}")),
+        }
+    }
+
+    fn force_release(&mut self) {
+        if let Some(mut keeper) = self.keeper.take() {
+            keeper.kill();
+            self.log.line("released: keeper ignored stdin closing, killed it");
         }
     }
 

@@ -21,6 +21,8 @@ const FAKE_KEEPER: &str = r#"#!/bin/sh
 echo "start $$" >> "$FAKE_DIR/keeper.log"
 echo "holding $$"
 while IFS= read -r line; do echo pong; done
+# Simulates a keeper that ignores the release signal.
+[ -e "$FAKE_DIR/ignore-release" ] && exec sleep 60
 # Release before writing to a possibly closed stdout.
 echo "exit $$" >> "$FAKE_DIR/keeper.log"
 echo "released stdin-closed"
@@ -258,6 +260,21 @@ fn a_keeper_that_dies_is_replaced() {
     let next = h.wait_for("the replacement", |s| holding(s) && keeper_pid(s) != first);
     assert_ne!(keeper_pid(&next), first);
     assert!(h.log().contains("keeper exited unexpectedly"));
+}
+
+#[test]
+fn a_keeper_that_ignores_release_cannot_block_the_next_hold() {
+    let h = Harness::new("stuck-release");
+    h.set_threads(&[("thread", "working")]);
+    h.run(&["start"]);
+    let first = keeper_pid(&h.wait_for("the first keeper", holding));
+    fs::write(h.dir.join("ignore-release"), "").unwrap();
+    h.set_threads(&[("thread", "done")]);
+    h.wait_for("the release", |s| s["hold"] == false && s["keeper"]["phase"] == "releasing");
+    h.set_threads(&[("thread", "working")]);
+    h.wait_for("a replacement keeper", |s| holding(s) && keeper_pid(s) != first);
+    fs::remove_file(h.dir.join("ignore-release")).unwrap();
+    assert!(h.log().contains("keeper ignored stdin closing, killed it"));
 }
 
 #[test]
