@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Keep Windows awake while T3 Code threads are working inside WSL."
+license = "MIT"
 publish = false
 
 [dependencies]

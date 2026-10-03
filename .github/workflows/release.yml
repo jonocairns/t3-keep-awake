@@ -1,0 +1,58 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Verify release tag
+        run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml)
+          test "$GITHUB_REF_NAME" = "v$version"
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools shellcheck
+          rustup show
+          rustup target add x86_64-unknown-linux-musl
+      - name: Validate
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+          shellcheck install.sh uninstall.sh
+          python3 tests/installer.py
+      - name: Build static release
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: |
+          cargo build --release --locked --target x86_64-unknown-linux-musl
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/t3-keep-awake dist/t3-keep-awake-linux-x86_64
+          if readelf -l dist/t3-keep-awake-linux-x86_64 | grep -q INTERP; then
+            echo "Release binary must be static" >&2
+            exit 1
+          fi
+          dist/t3-keep-awake-linux-x86_64 help
+          cd dist
+          sha256sum t3-keep-awake-linux-x86_64 > t3-keep-awake-linux-x86_64.sha256
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag --target "$GITHUB_SHA" \
+            --title "$GITHUB_REF_NAME" --generate-notes \
+            dist/t3-keep-awake-linux-x86_64 dist/t3-keep-awake-linux-x86_64.sha256

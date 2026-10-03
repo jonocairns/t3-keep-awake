@@ -1,6 +1,8 @@
 Capture durable conventions and recurring pitfalls here when they help future agents.
 
 - Base changes on `main` and use conventional commit prefixes.
+- Keep the installer self-contained and POSIX-compatible for `curl | sh`. Verify release checksums and stage replacements before stopping a working service. Test scripts with `python3 tests/installer.py` and `shellcheck install.sh uninstall.sh`; mocks must isolate Windows and systemd operations.
+- Release binaries are static x86_64 Linux builds for WSL. Tag a commit on `main` whose Cargo version matches the tag; the release workflow validates and publishes the binary and checksum from that immutable checkout.
 - After changes run `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`. Build the release binary, then use `t3-keep-awake restart` so the installed service picks up changes.
 - T3's SQLite projections are an internal interface. Open them read-only, retain WAL visibility, and treat schema changes as errors. Never migrate, repair, or write to T3's database.
 - Count current active AI turns, not the presence of T3 or a provider process. Join the session's active-turn ID to a running turn and matching provider runtime from the current server lifetime.
