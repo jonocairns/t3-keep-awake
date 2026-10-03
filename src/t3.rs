@@ -45,6 +45,7 @@ pub struct T3 {
 struct Runtime {
     version: u32,
     pid: u32,
+    host: Option<String>,
     port: u16,
     #[serde(rename = "startedAt")]
     started_at: String,
@@ -89,7 +90,7 @@ impl T3 {
         };
         // A listening socket also survives SIGSTOP. Require an HTTP response so
         // a hung server cannot keep renewing a persisted running turn.
-        if !server_responds(runtime.port) {
+        if !server_responds(runtime.host.as_deref(), runtime.port) {
             return Ok(Snapshot::offline());
         }
 
@@ -211,14 +212,18 @@ fn listening_process(runtime: &Runtime, proc_dir: &Path) -> Result<Option<u64>> 
     Ok(None)
 }
 
-fn server_responds(port: u16) -> bool {
+fn server_responds(host: Option<&str>, port: u16) -> bool {
     let deadline = Instant::now() + HEALTH_TIMEOUT;
-    for ip in [IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)] {
-        if http_response(SocketAddr::new(ip, port), deadline).is_ok() {
-            return true;
-        }
+    health_addresses(host).into_iter().any(|ip| http_response(SocketAddr::new(ip, port), deadline).is_ok())
+}
+
+/// A server bound to one address answers only there. Wildcards and names
+/// are checked on loopback: resolving a name could block without a bound.
+fn health_addresses(host: Option<&str>) -> Vec<IpAddr> {
+    match host.map(|host| host.trim_matches(['[', ']']).parse::<IpAddr>()) {
+        Some(Ok(ip)) if !ip.is_unspecified() => vec![ip],
+        _ => vec![IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)],
     }
-    false
 }
 
 fn http_response(address: SocketAddr, deadline: Instant) -> Result<()> {
@@ -250,6 +255,9 @@ fn http_response(address: SocketAddr, deadline: Instant) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::TcpListener;
+    use std::thread;
+
     use super::*;
 
     fn database() -> Connection {
@@ -345,6 +353,30 @@ mod tests {
         assert_eq!(threads(&connection).len(), 1);
         connection.execute_batch("DROP TABLE effect_sql_migrations;").unwrap();
         assert!(schema_warning(&connection).unwrap().contains("cannot read the T3 schema version"));
+    }
+
+    #[test]
+    fn the_health_check_uses_the_advertised_host() {
+        let listener = TcpListener::bind((Ipv4Addr::new(127, 0, 0, 2), 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let _ = stream.read(&mut [0; 512]);
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
+            }
+        });
+        assert!(server_responds(Some("127.0.0.2"), port));
+        assert!(!server_responds(Some("0.0.0.0"), port), "nothing listens on 127.0.0.1");
+    }
+
+    #[test]
+    fn wildcard_and_named_hosts_are_checked_on_loopback() {
+        let loopback = [IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)];
+        for host in [None, Some("0.0.0.0"), Some("::"), Some("localhost")] {
+            assert_eq!(health_addresses(host), loopback, "{host:?}");
+        }
+        assert_eq!(health_addresses(Some("100.64.0.7")), [IpAddr::V4(Ipv4Addr::new(100, 64, 0, 7))]);
+        assert_eq!(health_addresses(Some("[fd7a::1]")), ["fd7a::1".parse::<IpAddr>().unwrap()]);
     }
 
     #[test]

@@ -103,7 +103,8 @@ Every poll reads a full snapshot; it does not depend on receiving a particular
 start or finish event. A singleton lock prevents duplicate controllers.
 
 Before reading activity, the daemon checks that the PID in `server-runtime.json`
-owns T3's listening socket and responds to a bounded HTTP request. It then opens
+owns T3's listening socket and responds to a bounded HTTP request on the host it
+advertises, or on loopback when T3 listens on every address. It then opens
 `state.sqlite` **read-only**, preserving WAL visibility, and joins current thread,
 session, provider-runtime, and turn state. A turn must be running in both the
 session and current-turn projections, with a matching provider active-turn ID
