@@ -157,6 +157,9 @@ cargo test
 python3 tests/installer.py
 ```
 
+CI runs these checks, plus `shellcheck install.sh uninstall.sh`, on every pull
+request and push to `main`.
+
 Tests use isolated T3 SQLite fixtures, real loopback HTTP listeners, and fake
 keepers. They cover active and idle turns, concurrent threads, permission
 prompts, old provider observations, incompatible schemas, server disappearance,
