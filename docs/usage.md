@@ -5,10 +5,6 @@ WSL. Once all turns finish, Windows returns to its normal sleep policy after a
 30-second grace period. T3 being open, an idle agent process, or a saved thread
 by itself does not keep the machine awake.
 
-This is a standalone WSL daemon derived from
-[herdr-keep-awake](https://github.com/jonocairns/herdr-keep-awake). It does not
-require Herdr, a T3 plugin, or changes to T3 Code.
-
 The display can turn off and lock normally. Closing the laptop lid or explicitly
 putting Windows to sleep still follows Windows' own settings.
 
@@ -19,24 +15,15 @@ interop (`powershell.exe`). T3 Code must run its agents in the same WSL distro.
 The release binary is static and includes SQLite; Rust and a C compiler are
 not required.
 
-For a public repository:
-
 ```sh
 curl -fsSL https://raw.githubusercontent.com/jonocairns/t3-keep-awake/main/install.sh | sh
 ```
 
-While the repository is private, sign in with `gh auth login` and use:
-
-```sh
-gh api repos/jonocairns/t3-keep-awake/contents/install.sh -H 'Accept: application/vnd.github.raw' | sh
-```
-
 The installer downloads the latest release, verifies its SHA-256 checksum,
 installs it in `~/.local/bin`, and enables and starts `t3-keep-awake.service` in
-your systemd user manager. It uses authenticated `gh` downloads when available.
-It enables user
-linger so the service starts when this WSL distro starts and survives closing
-terminals. It does not start WSL when Windows boots or change Windows power
+your systemd user manager. It enables user linger so the service starts when
+this WSL distro starts and survives closing terminals. It does not start WSL
+when Windows boots or change Windows power
 settings. Re-run the same command to update; your configuration and logs are
 preserved. Add `~/.local/bin` to your shell's `PATH` if the installer prompts you.
 
@@ -149,12 +136,6 @@ not need to keep this Windows host awake.
 curl -fsSL https://raw.githubusercontent.com/jonocairns/t3-keep-awake/main/uninstall.sh | sh
 ```
 
-For a private repository, use:
-
-```sh
-gh api repos/jonocairns/t3-keep-awake/contents/uninstall.sh -H 'Accept: application/vnd.github.raw' | sh
-```
-
 You can also run `sh ./uninstall.sh` from a checkout. This stops and disables
 the service, releases the keeper, and removes the unit and binary.
 Configuration, logs, and user linger remain. Linger is shared by
@@ -189,4 +170,4 @@ the latest tag once, then download both assets from that same release.
 
 ## Licence
 
-[MIT](../LICENSE). Derived from Jono Cairns' herdr-keep-awake.
+[MIT](../LICENSE).
