@@ -22,7 +22,9 @@ CREATE TABLE projection_turns (
     row_id INTEGER PRIMARY KEY AUTOINCREMENT,
     thread_id TEXT NOT NULL,
     turn_id TEXT,
-    state TEXT NOT NULL
+    state TEXT NOT NULL,
+    -- The reader's join relies on this to report each turn once.
+    UNIQUE (thread_id, turn_id)
 );
 CREATE TABLE effect_sql_migrations (
     migration_id INTEGER PRIMARY KEY NOT NULL,
