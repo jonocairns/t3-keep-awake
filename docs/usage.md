@@ -23,9 +23,9 @@ The installer downloads the latest release, verifies its SHA-256 checksum,
 installs it in `~/.local/bin`, and enables and starts `t3-keep-awake.service` in
 your systemd user manager. It enables user linger so the service starts when
 this WSL distro starts and survives closing terminals. It does not start WSL
-when Windows boots or change Windows power
-settings. Re-run the same command to update; your configuration and logs are
-preserved. Add `~/.local/bin` to your shell's `PATH` if the installer prompts you.
+when Windows boots or change Windows power settings. Re-run the same command to
+update; your configuration and logs are preserved. Add `~/.local/bin` to your
+shell's `PATH` if the installer prompts you.
 
 To install a specific release, pass `T3_KEEP_AWAKE_VERSION=v0.1.0` to `sh`.
 
