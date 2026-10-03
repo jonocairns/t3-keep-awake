@@ -16,11 +16,15 @@ use crate::util::truncate;
 
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const DATABASE_TIMEOUT: Duration = Duration::from_millis(500);
+/// The newest T3 database migration this reader has been checked against.
+const VERIFIED_MIGRATION: i64 = 54;
 
 pub struct Snapshot {
     pub running_servers: usize,
     pub threads: Vec<Thread>,
     pub errors: Vec<String>,
+    /// Problems that do not invalidate the read, such as a newer T3 schema.
+    pub warnings: Vec<String>,
 }
 
 impl Snapshot {
@@ -29,7 +33,7 @@ impl Snapshot {
     }
 
     fn offline() -> Self {
-        Self { running_servers: 0, threads: Vec::new(), errors: Vec::new() }
+        Self { running_servers: 0, threads: Vec::new(), errors: Vec::new(), warnings: Vec::new() }
     }
 }
 
@@ -65,6 +69,7 @@ impl T3 {
                 running_servers: 0,
                 threads: Vec::new(),
                 errors: vec![format!("{}: {error:#}", self.data_dir.display())],
+                warnings: Vec::new(),
             },
         }
     }
@@ -94,13 +99,14 @@ impl T3 {
                 .with_context(|| format!("opening {} read-only", database.display()))?;
         connection.busy_timeout(DATABASE_TIMEOUT)?;
         let server_id = format!("{}:{}:{process_start}", self.data_dir.display(), runtime.started_at);
+        let warnings = schema_warning(&connection).into_iter().collect();
         let threads = read_threads(&connection, &server_id, &runtime.started_at)?;
 
         // The process may have exited while SQLite was being read.
         if listening_process(&runtime, Path::new("/proc"))? != Some(process_start) {
             return Ok(Snapshot::offline());
         }
-        Ok(Snapshot { running_servers: 1, threads, errors: Vec::new() })
+        Ok(Snapshot { running_servers: 1, threads, errors: Vec::new(), warnings })
     }
 }
 
@@ -139,6 +145,22 @@ fn read_threads(connection: &Connection, server_id: &str, started_at: &str) -> R
         })
     })?;
     threads.collect::<rusqlite::Result<_>>().context("decoding T3 thread state")
+}
+
+/// A newer schema can still satisfy the query while renaming the states it
+/// matches, which would silently hide work. Warn rather than fail: most T3
+/// migrations do not touch these projections.
+fn schema_warning(connection: &Connection) -> Option<String> {
+    let latest = connection
+        .query_row("SELECT max(migration_id) FROM effect_sql_migrations", [], |row| row.get::<_, Option<i64>>(0));
+    match latest {
+        Ok(Some(latest)) if latest > VERIFIED_MIGRATION => Some(format!(
+            "T3 database migration {latest} is newer than the verified {VERIFIED_MIGRATION}; \
+             working turns may go undetected"
+        )),
+        Ok(_) => None,
+        Err(error) => Some(format!("cannot read the T3 schema version: {error}")),
+    }
 }
 
 /// Check that the runtime PID owns the advertised listening socket. A PID
@@ -307,6 +329,22 @@ mod tests {
         assert_ne!(first.seq, next.seq);
         let restarted = read_threads(&connection, "restarted-server", "2026-10-03T09:00:00.000Z").unwrap();
         assert_ne!(next.id, restarted[0].id);
+    }
+
+    #[test]
+    fn a_newer_t3_schema_is_a_warning_and_the_read_continues() {
+        let connection = database();
+        let migrate = |id: i64| {
+            connection.execute("INSERT INTO effect_sql_migrations(migration_id, name) VALUES (?1, 'm')", [id]).unwrap()
+        };
+        assert_eq!(schema_warning(&connection), None, "a fresh database has no migrations yet");
+        migrate(VERIFIED_MIGRATION);
+        assert_eq!(schema_warning(&connection), None);
+        migrate(VERIFIED_MIGRATION + 1);
+        assert!(schema_warning(&connection).unwrap().contains("is newer than the verified"));
+        assert_eq!(threads(&connection).len(), 1);
+        connection.execute_batch("DROP TABLE effect_sql_migrations;").unwrap();
+        assert!(schema_warning(&connection).unwrap().contains("cannot read the T3 schema version"));
     }
 
     #[test]

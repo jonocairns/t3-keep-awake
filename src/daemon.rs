@@ -160,6 +160,7 @@ struct Daemon {
     poll_requested: bool,
     running_servers: usize,
     t3_errors: Vec<String>,
+    t3_warnings: Vec<String>,
     snapshot_expired: bool,
     keeper: Option<Keeper>,
     generation: u64,
@@ -184,6 +185,7 @@ impl Daemon {
             poll_requested: true,
             running_servers: 0,
             t3_errors: Vec::new(),
+            t3_warnings: Vec::new(),
             snapshot_expired: false,
             keeper: None,
             generation: 0,
@@ -252,6 +254,14 @@ impl Daemon {
                 self.log.line("T3: readable again");
             }
             self.t3_errors = snapshot.errors.clone();
+        }
+        // Only a successful read can check the schema, so the last warning
+        // stands while T3 is stopped or unreadable.
+        if snapshot.running_servers > 0 && snapshot.warnings != self.t3_warnings {
+            for warning in &snapshot.warnings {
+                self.log.line(format!("warning: {warning}"));
+            }
+            self.t3_warnings = snapshot.warnings.clone();
         }
 
         let decision = if snapshot.running_servers == 0 && snapshot.complete() {
@@ -450,6 +460,7 @@ impl Daemon {
             running_servers: self.running_servers,
             last_poll_secs_ago: self.last_poll.map_or(0, |at| now.duration_since(at).as_secs()),
             t3_errors: self.t3_errors.clone(),
+            t3_warnings: self.t3_warnings.clone(),
             keeper_failures: self.failures,
             retry_in_secs: self.retry_at.filter(|at| *at > now).map(|at| at.duration_since(now).as_secs()),
         };

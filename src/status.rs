@@ -18,6 +18,9 @@ pub struct Status {
     pub running_servers: usize,
     pub last_poll_secs_ago: u64,
     pub t3_errors: Vec<String>,
+    /// Older daemons do not report warnings.
+    #[serde(default)]
+    pub t3_warnings: Vec<String>,
     pub keeper_failures: u32,
     pub retry_in_secs: Option<u64>,
 }
@@ -70,6 +73,7 @@ impl Status {
             secs(self.last_poll_secs_ago)
         );
         list(&mut out, "errors", &self.t3_errors);
+        list(&mut out, "warnings", &self.t3_warnings);
         let _ = writeln!(out, "daemon   pid {}, up {}", self.daemon_pid, secs(self.uptime_secs));
         out
     }

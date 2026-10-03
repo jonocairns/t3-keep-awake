@@ -346,6 +346,17 @@ fn an_incompatible_database_releases_and_recovers_without_restart() {
 }
 
 #[test]
+fn a_newer_t3_schema_warns_without_releasing() {
+    let h = Harness::new("migration");
+    h.set_threads(&[("thread", "working")]);
+    h.run(&["start"]);
+    h.wait_for("the hold", holding);
+    h.database.execute("INSERT INTO effect_sql_migrations(migration_id, name) VALUES (1000, 'newer')", []).unwrap();
+    h.wait_for("the warning", |s| holding(s) && s["t3_warnings"].as_array().is_some_and(|w| !w.is_empty()));
+    assert!(h.log().contains("warning: T3 database migration 1000 is newer"));
+}
+
+#[test]
 fn the_controller_discovers_a_returning_server_without_hooks() {
     let h = Harness::new("discovery");
     h.set_server_running(false);

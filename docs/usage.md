@@ -110,10 +110,13 @@ session and current-turn projections, with a matching provider active-turn ID
 and a provider-runtime observation from this server's lifetime. Deleted threads,
 old turns, and idle provider processes do not count.
 
-This has been checked against T3 Code 0.0.45. The database projections are an
-internal T3 interface, so a future schema change may require updating the
-reader. Unsupported metadata, schema changes, and read failures are reported
-in `status` and the log; they cannot keep extending a hold indefinitely.
+This has been checked against T3 Code 0.0.45 and T3 database migration 54. The
+database projections are an internal T3 interface, so a future schema change may
+require updating the reader. Missing tables or columns, unsupported metadata,
+and read failures are errors: they are reported in `status` and the log, and
+they cannot keep extending a hold indefinitely. A newer T3 migration is only a
+warning, because most migrations do not touch these projections, but working
+turns may go undetected until the reader is checked against it.
 
 A stopped or unresponsive server releases immediately on the next poll, even
 if its database still says a turn is running. Other read failures can preserve

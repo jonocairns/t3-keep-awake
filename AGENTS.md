@@ -4,7 +4,8 @@ Capture durable conventions and recurring pitfalls here when they help future ag
 - Keep the installer self-contained and POSIX-compatible for `curl | sh`. Verify release checksums and stage replacements before stopping a working service. Test scripts with `python3 tests/installer.py` and `shellcheck install.sh uninstall.sh`; mocks must isolate Windows and systemd operations.
 - Release binaries are static x86_64 Linux builds for WSL. Tag a commit on `main` whose Cargo version matches the tag; the release workflow validates and publishes the binary and checksum from that immutable checkout.
 - After changes run `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`. Build the release binary, then use `t3-keep-awake restart` so the installed service picks up changes.
-- T3's SQLite projections are an internal interface. Open them read-only, retain WAL visibility, and treat schema changes as errors. Never migrate, repair, or write to T3's database.
+- T3's SQLite projections are an internal interface. Open them read-only, retain WAL visibility, and treat missing tables or columns as errors. Never migrate, repair, or write to T3's database.
+- A T3 migration newer than `VERIFIED_MIGRATION` is a warning, not an error: it must not release a hold. Raise the constant only after checking the new schema's states and payloads against the reader.
 - Count current active AI turns, not the presence of T3 or a provider process. Join the session's active-turn ID to a running turn and matching provider runtime from the current server lifetime.
 - Confirm that the runtime PID owns the listening socket and answers HTTP before trusting persisted running state. A stopped or unresponsive server must release on the next poll.
 - Pending async user questions can coexist with work. They must not hide an otherwise running turn; classify pending permission approvals through the explicit blocked policy.

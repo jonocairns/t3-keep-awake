@@ -24,3 +24,7 @@ CREATE TABLE projection_turns (
     turn_id TEXT,
     state TEXT NOT NULL
 );
+CREATE TABLE effect_sql_migrations (
+    migration_id INTEGER PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL
+);
