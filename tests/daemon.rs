@@ -21,6 +21,8 @@ const FAKE_KEEPER: &str = r#"#!/bin/sh
 echo "start $$" >> "$FAKE_DIR/keeper.log"
 echo "holding $$"
 while IFS= read -r line; do echo pong; done
+# Simulates a keeper that ignores the release signal.
+[ -e "$FAKE_DIR/ignore-release" ] && exec sleep 60
 # Release before writing to a possibly closed stdout.
 echo "exit $$" >> "$FAKE_DIR/keeper.log"
 echo "released stdin-closed"
@@ -261,6 +263,37 @@ fn a_keeper_that_dies_is_replaced() {
 }
 
 #[test]
+fn a_keeper_that_ignores_release_cannot_block_the_next_hold() {
+    let h = Harness::new("stuck-release");
+    h.set_threads(&[("thread", "working")]);
+    h.run(&["start"]);
+    let first = keeper_pid(&h.wait_for("the first keeper", holding));
+    fs::write(h.dir.join("ignore-release"), "").unwrap();
+    h.set_threads(&[("thread", "done")]);
+    h.wait_for("the release", |s| s["hold"] == false && s["keeper"]["phase"] == "releasing");
+    h.set_threads(&[("thread", "working")]);
+    h.wait_for("a replacement keeper", |s| holding(s) && keeper_pid(s) != first);
+    fs::remove_file(h.dir.join("ignore-release")).unwrap();
+    assert!(h.log().contains("keeper ignored stdin closing, killed it"));
+}
+
+#[test]
+fn a_server_that_briefly_stops_answering_keeps_its_stuck_timer() {
+    let h = Harness::new("blip");
+    fs::write(h.dir.join("config.toml"), format!("{CONFIG}max_working_secs = 4\n")).unwrap();
+    h.set_threads(&[("thread", "working")]);
+    h.run(&["start"]);
+    h.wait_for("the hold", holding);
+    h.respond.store(false, Ordering::SeqCst);
+    h.wait_for("the unresponsive server", |s| s["reason"] == "T3 server not running");
+    thread::sleep(Duration::from_secs(4));
+    h.respond.store(true, Ordering::SeqCst);
+    let status = h.wait_for("the same server", |s| s["running_servers"] == 1);
+    assert_eq!(status["hold"], false, "{status}");
+    assert!(status["reason"].as_str().unwrap().contains("treated as stuck"), "{status}");
+}
+
+#[test]
 fn a_killed_daemon_releases_its_keeper_and_start_recovers_it() {
     let h = Harness::new("orphan");
     h.set_threads(&[("thread", "working")]);
@@ -310,6 +343,17 @@ fn an_incompatible_database_releases_and_recovers_without_restart() {
     assert!(h.log().contains("database schema may have changed"));
     h.database.execute_batch("ALTER TABLE incompatible_threads RENAME TO projection_threads;").unwrap();
     h.wait_for("the recovered hold", holding);
+}
+
+#[test]
+fn a_newer_t3_schema_warns_without_releasing() {
+    let h = Harness::new("migration");
+    h.set_threads(&[("thread", "working")]);
+    h.run(&["start"]);
+    h.wait_for("the hold", holding);
+    h.database.execute("INSERT INTO effect_sql_migrations(migration_id, name) VALUES (1000, 'newer')", []).unwrap();
+    h.wait_for("the warning", |s| holding(s) && s["t3_warnings"].as_array().is_some_and(|w| !w.is_empty()));
+    assert!(h.log().contains("warning: T3 database migration 1000 is newer"));
 }
 
 #[test]

@@ -23,9 +23,9 @@ The installer downloads the latest release, verifies its SHA-256 checksum,
 installs it in `~/.local/bin`, and enables and starts `t3-keep-awake.service` in
 your systemd user manager. It enables user linger so the service starts when
 this WSL distro starts and survives closing terminals. It does not start WSL
-when Windows boots or change Windows power
-settings. Re-run the same command to update; your configuration and logs are
-preserved. Add `~/.local/bin` to your shell's `PATH` if the installer prompts you.
+when Windows boots or change Windows power settings. Re-run the same command to
+update; your configuration and logs are preserved. Add `~/.local/bin` to your
+shell's `PATH` if the installer prompts you.
 
 To install a specific release, pass `T3_KEEP_AWAKE_VERSION=v0.1.0` to `sh`.
 
@@ -103,17 +103,21 @@ Every poll reads a full snapshot; it does not depend on receiving a particular
 start or finish event. A singleton lock prevents duplicate controllers.
 
 Before reading activity, the daemon checks that the PID in `server-runtime.json`
-owns T3's listening socket and responds to a bounded HTTP request. It then opens
+owns T3's listening socket and responds to a bounded HTTP request on the host it
+advertises, or on loopback when T3 listens on every address. It then opens
 `state.sqlite` **read-only**, preserving WAL visibility, and joins current thread,
 session, provider-runtime, and turn state. A turn must be running in both the
 session and current-turn projections, with a matching provider active-turn ID
 and a provider-runtime observation from this server's lifetime. Deleted threads,
 old turns, and idle provider processes do not count.
 
-This has been checked against T3 Code 0.0.45. The database projections are an
-internal T3 interface, so a future schema change may require updating the
-reader. Unsupported metadata, schema changes, and read failures are reported
-in `status` and the log; they cannot keep extending a hold indefinitely.
+This has been checked against T3 Code 0.0.45 and T3 database migration 54. The
+database projections are an internal T3 interface, so a future schema change may
+require updating the reader. Missing tables or columns, unsupported metadata,
+and read failures are errors: they are reported in `status` and the log, and
+they cannot keep extending a hold indefinitely. A newer T3 migration is only a
+warning, because most migrations do not touch these projections, but working
+turns may go undetected until the reader is checked against it.
 
 A stopped or unresponsive server releases immediately on the next poll, even
 if its database still says a turn is running. Other read failures can preserve
@@ -125,7 +129,9 @@ The Windows keeper uses `SetThreadExecutionState` from one long-lived
 PowerShell process. It releases when stdin closes, the process exits, or a
 heartbeat is missing for 60 seconds. Keeper failures retry with bounded backoff.
 The daemon resolves WSL's init interop socket for each Windows invocation, so it
-does not need a terminal's `WSL_INTEROP` environment.
+does not need a terminal's `WSL_INTEROP` environment. It looks for
+`powershell.exe` on `PATH`, then on each mounted Windows drive, so the service
+does not need the terminal's Windows `PATH` either.
 
 Only this configured WSL server is watched. Work hosted on another machine does
 not need to keep this Windows host awake.
@@ -150,6 +156,9 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 python3 tests/installer.py
 ```
+
+CI runs these checks, plus `shellcheck install.sh uninstall.sh`, on every pull
+request and push to `main`.
 
 Tests use isolated T3 SQLite fixtures, real loopback HTTP listeners, and fake
 keepers. They cover active and idle turns, concurrent threads, permission

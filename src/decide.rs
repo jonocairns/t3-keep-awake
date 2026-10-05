@@ -1,20 +1,15 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use serde::Deserialize;
-
 use crate::config::Config;
 use crate::util::fmt_duration;
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+/// The state of a thread's running turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThreadStatus {
-    Idle,
     Working,
+    /// Waiting on a permission approval.
     Blocked,
-    Done,
-    #[serde(other)]
-    Unknown,
 }
 
 #[derive(Clone, Debug)]
@@ -96,6 +91,13 @@ impl Tracker {
         };
         Decision { hold: false, reason, active, stale }
     }
+
+    /// A stopped or unresponsive server cannot authorize a grace hold. Stuck
+    /// timers survive: the same server may answer the next poll, and a
+    /// restarted server's turns have new identities anyway.
+    pub fn server_offline(&mut self) {
+        self.last_active = None;
+    }
 }
 
 #[cfg(test)]
@@ -127,8 +129,7 @@ mod tests {
 
     #[test]
     fn nothing_ever_working_does_not_hold() {
-        let decision =
-            Tracker::default().observe(&[thread("a", ThreadStatus::Idle, 1)], true, Instant::now(), &config());
+        let decision = Tracker::default().observe(&[], true, Instant::now(), &config());
         assert!(!decision.hold);
         assert_eq!(decision.reason, "no threads working");
     }
@@ -139,12 +140,11 @@ mod tests {
         let mut tracker = Tracker::default();
         tracker.observe(&[thread("a", ThreadStatus::Working, 1)], true, t0, &config());
 
-        let idle = [thread("a", ThreadStatus::Idle, 2)];
-        let within = tracker.observe(&idle, true, t0 + secs(299), &config());
+        let within = tracker.observe(&[], true, t0 + secs(299), &config());
         assert!(within.hold);
         assert_eq!(within.reason, "no threads working; grace period, 1s left");
 
-        let after = tracker.observe(&idle, true, t0 + secs(300), &config());
+        let after = tracker.observe(&[], true, t0 + secs(300), &config());
         assert!(!after.hold);
     }
 
@@ -155,7 +155,7 @@ mod tests {
         let both = [thread("a", ThreadStatus::Working, 1), thread("b", ThreadStatus::Working, 2)];
         assert_eq!(tracker.observe(&both, true, t0, &config()).reason, "2 threads working");
 
-        let one = [thread("a", ThreadStatus::Done, 3), thread("b", ThreadStatus::Working, 2)];
+        let one = [thread("b", ThreadStatus::Working, 2)];
         let decision = tracker.observe(&one, true, t0 + secs(600), &config());
         assert!(decision.hold);
         assert_eq!(decision.active, ["b"]);
@@ -186,11 +186,11 @@ mod tests {
     }
 
     #[test]
-    fn a_new_status_transition_restarts_the_stuck_timer() {
+    fn a_new_turn_restarts_the_stuck_timer() {
         let t0 = Instant::now();
         let mut tracker = Tracker::default();
         tracker.observe(&[thread("a", ThreadStatus::Working, 1)], true, t0, &config());
-        tracker.observe(&[thread("a", ThreadStatus::Idle, 2)], true, t0 + secs(3000), &config());
+        tracker.observe(&[], true, t0 + secs(3000), &config());
         let decision = tracker.observe(&[thread("a", ThreadStatus::Working, 3)], true, t0 + secs(4000), &config());
         assert!(decision.hold);
         assert!(decision.stale.is_empty());
@@ -225,6 +225,19 @@ mod tests {
         let stuck = [thread("a", ThreadStatus::Working, 1)];
         tracker.observe(&stuck, true, t0, &config());
         tracker.observe(&[], false, t0 + secs(10), &config());
+        let decision = tracker.observe(&stuck, true, t0 + secs(3600), &config());
+        assert_eq!(decision.stale, ["a"]);
+    }
+
+    #[test]
+    fn an_offline_server_ends_the_grace_period_but_not_the_stuck_timer() {
+        let t0 = Instant::now();
+        let mut tracker = Tracker::default();
+        let stuck = [thread("a", ThreadStatus::Working, 1)];
+        tracker.observe(&stuck, true, t0, &config());
+        tracker.server_offline();
+        assert!(!tracker.observe(&[], false, t0 + secs(10), &config()).hold);
+
         let decision = tracker.observe(&stuck, true, t0 + secs(3600), &config());
         assert_eq!(decision.stale, ["a"]);
     }

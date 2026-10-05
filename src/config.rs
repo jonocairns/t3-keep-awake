@@ -4,13 +4,13 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 /// A working decision is released when its source snapshot reaches this age.
 pub const MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(60);
 
 /// Read once when the daemon starts; `t3-keep-awake restart` applies edits.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// T3 Code userdata directory (contains state.sqlite and server-runtime.json).

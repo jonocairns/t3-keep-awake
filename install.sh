@@ -96,6 +96,8 @@ Type=simple
 ExecStart=%h/.local/bin/t3-keep-awake daemon
 Restart=on-failure
 RestartSec=5
+# Signal only the daemon, so it releases its keeper itself before exiting.
+KillMode=mixed
 TimeoutStopSec=15
 
 [Install]

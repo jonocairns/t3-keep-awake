@@ -16,11 +16,15 @@ use crate::util::truncate;
 
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const DATABASE_TIMEOUT: Duration = Duration::from_millis(500);
+/// The newest T3 database migration this reader has been checked against.
+const VERIFIED_MIGRATION: i64 = 54;
 
 pub struct Snapshot {
     pub running_servers: usize,
     pub threads: Vec<Thread>,
     pub errors: Vec<String>,
+    /// Problems that do not invalidate the read, such as a newer T3 schema.
+    pub warnings: Vec<String>,
 }
 
 impl Snapshot {
@@ -29,7 +33,7 @@ impl Snapshot {
     }
 
     fn offline() -> Self {
-        Self { running_servers: 0, threads: Vec::new(), errors: Vec::new() }
+        Self { running_servers: 0, threads: Vec::new(), errors: Vec::new(), warnings: Vec::new() }
     }
 }
 
@@ -41,6 +45,7 @@ pub struct T3 {
 struct Runtime {
     version: u32,
     pid: u32,
+    host: Option<String>,
     port: u16,
     #[serde(rename = "startedAt")]
     started_at: String,
@@ -65,6 +70,7 @@ impl T3 {
                 running_servers: 0,
                 threads: Vec::new(),
                 errors: vec![format!("{}: {error:#}", self.data_dir.display())],
+                warnings: Vec::new(),
             },
         }
     }
@@ -84,7 +90,7 @@ impl T3 {
         };
         // A listening socket also survives SIGSTOP. Require an HTTP response so
         // a hung server cannot keep renewing a persisted running turn.
-        if !server_responds(runtime.port) {
+        if !server_responds(runtime.host.as_deref(), runtime.port) {
             return Ok(Snapshot::offline());
         }
 
@@ -94,13 +100,14 @@ impl T3 {
                 .with_context(|| format!("opening {} read-only", database.display()))?;
         connection.busy_timeout(DATABASE_TIMEOUT)?;
         let server_id = format!("{}:{}:{process_start}", self.data_dir.display(), runtime.started_at);
+        let warnings = schema_warning(&connection).into_iter().collect();
         let threads = read_threads(&connection, &server_id, &runtime.started_at)?;
 
         // The process may have exited while SQLite was being read.
         if listening_process(&runtime, Path::new("/proc"))? != Some(process_start) {
             return Ok(Snapshot::offline());
         }
-        Ok(Snapshot { running_servers: 1, threads, errors: Vec::new() })
+        Ok(Snapshot { running_servers: 1, threads, errors: Vec::new(), warnings })
     }
 }
 
@@ -139,6 +146,22 @@ fn read_threads(connection: &Connection, server_id: &str, started_at: &str) -> R
         })
     })?;
     threads.collect::<rusqlite::Result<_>>().context("decoding T3 thread state")
+}
+
+/// A newer schema can still satisfy the query while renaming the states it
+/// matches, which would silently hide work. Warn rather than fail: most T3
+/// migrations do not touch these projections.
+fn schema_warning(connection: &Connection) -> Option<String> {
+    let latest = connection
+        .query_row("SELECT max(migration_id) FROM effect_sql_migrations", [], |row| row.get::<_, Option<i64>>(0));
+    match latest {
+        Ok(Some(latest)) if latest > VERIFIED_MIGRATION => Some(format!(
+            "T3 database migration {latest} is newer than the verified {VERIFIED_MIGRATION}; \
+             working turns may go undetected"
+        )),
+        Ok(_) => None,
+        Err(error) => Some(format!("cannot read the T3 schema version: {error}")),
+    }
 }
 
 /// Check that the runtime PID owns the advertised listening socket. A PID
@@ -189,14 +212,18 @@ fn listening_process(runtime: &Runtime, proc_dir: &Path) -> Result<Option<u64>> 
     Ok(None)
 }
 
-fn server_responds(port: u16) -> bool {
+fn server_responds(host: Option<&str>, port: u16) -> bool {
     let deadline = Instant::now() + HEALTH_TIMEOUT;
-    for ip in [IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)] {
-        if http_response(SocketAddr::new(ip, port), deadline).is_ok() {
-            return true;
-        }
+    health_addresses(host).into_iter().any(|ip| http_response(SocketAddr::new(ip, port), deadline).is_ok())
+}
+
+/// A server bound to one address answers only there. Wildcards and names
+/// are checked on loopback: resolving a name could block without a bound.
+fn health_addresses(host: Option<&str>) -> Vec<IpAddr> {
+    match host.map(|host| host.trim_matches(['[', ']']).parse::<IpAddr>()) {
+        Some(Ok(ip)) if !ip.is_unspecified() => vec![ip],
+        _ => vec![IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)],
     }
-    false
 }
 
 fn http_response(address: SocketAddr, deadline: Instant) -> Result<()> {
@@ -228,6 +255,9 @@ fn http_response(address: SocketAddr, deadline: Instant) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::TcpListener;
+    use std::thread;
+
     use super::*;
 
     fn database() -> Connection {
@@ -307,6 +337,46 @@ mod tests {
         assert_ne!(first.seq, next.seq);
         let restarted = read_threads(&connection, "restarted-server", "2026-10-03T09:00:00.000Z").unwrap();
         assert_ne!(next.id, restarted[0].id);
+    }
+
+    #[test]
+    fn a_newer_t3_schema_is_a_warning_and_the_read_continues() {
+        let connection = database();
+        let migrate = |id: i64| {
+            connection.execute("INSERT INTO effect_sql_migrations(migration_id, name) VALUES (?1, 'm')", [id]).unwrap()
+        };
+        assert_eq!(schema_warning(&connection), None, "a fresh database has no migrations yet");
+        migrate(VERIFIED_MIGRATION);
+        assert_eq!(schema_warning(&connection), None);
+        migrate(VERIFIED_MIGRATION + 1);
+        assert!(schema_warning(&connection).unwrap().contains("is newer than the verified"));
+        assert_eq!(threads(&connection).len(), 1);
+        connection.execute_batch("DROP TABLE effect_sql_migrations;").unwrap();
+        assert!(schema_warning(&connection).unwrap().contains("cannot read the T3 schema version"));
+    }
+
+    #[test]
+    fn the_health_check_uses_the_advertised_host() {
+        let listener = TcpListener::bind((Ipv4Addr::new(127, 0, 0, 2), 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let _ = stream.read(&mut [0; 512]);
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
+            }
+        });
+        assert!(server_responds(Some("127.0.0.2"), port));
+        assert!(!server_responds(Some("0.0.0.0"), port), "nothing listens on 127.0.0.1");
+    }
+
+    #[test]
+    fn wildcard_and_named_hosts_are_checked_on_loopback() {
+        let loopback = [IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)];
+        for host in [None, Some("0.0.0.0"), Some("::"), Some("localhost")] {
+            assert_eq!(health_addresses(host), loopback, "{host:?}");
+        }
+        assert_eq!(health_addresses(Some("100.64.0.7")), [IpAddr::V4(Ipv4Addr::new(100, 64, 0, 7))]);
+        assert_eq!(health_addresses(Some("[fd7a::1]")), ["fd7a::1".parse::<IpAddr>().unwrap()]);
     }
 
     #[test]
