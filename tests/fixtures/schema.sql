@@ -1,4 +1,4 @@
--- Relevant columns from T3 Code 0.0.45's persisted projections.
+-- Relevant columns from T3 Code 0.0.45's persisted projections (state.sqlite, migration 54).
 CREATE TABLE projection_threads (
     thread_id TEXT PRIMARY KEY,
     title TEXT NOT NULL,

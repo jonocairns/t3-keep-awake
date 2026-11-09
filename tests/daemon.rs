@@ -46,9 +46,11 @@ impl Harness {
         fs::write(dir.join("keeper"), FAKE_KEEPER).unwrap();
         fs::set_permissions(dir.join("keeper"), fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(dir.join("config.toml"), CONFIG).unwrap();
-        let database = Connection::open(dir.join("userdata/state.sqlite")).unwrap();
+        // The test process stands in for the T3 server, so this connection is
+        // also what makes the daemon pick statev2.sqlite.
+        let database = Connection::open(dir.join("userdata/statev2.sqlite")).unwrap();
         database.pragma_update(None, "journal_mode", "WAL").unwrap();
-        database.execute_batch(include_str!("fixtures/schema.sql")).unwrap();
+        database.execute_batch(include_str!("fixtures/schema_v2.sql")).unwrap();
 
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -123,37 +125,50 @@ impl Harness {
         let transaction = self.database.unchecked_transaction().unwrap();
         transaction
             .execute_batch(
-                "DELETE FROM projection_threads; DELETE FROM projection_thread_sessions;
-             DELETE FROM provider_session_runtime; DELETE FROM projection_turns;",
+                "DELETE FROM orchestration_v2_projection_threads; DELETE FROM orchestration_v2_projection_runs;
+                 DELETE FROM orchestration_v2_projection_run_attempts;
+                 DELETE FROM orchestration_v2_projection_provider_turns;
+                 DELETE FROM orchestration_v2_projection_nodes;
+                 DELETE FROM orchestration_v2_projection_runtime_requests;",
             )
             .unwrap();
         for (id, state) in threads {
-            let turn = format!("turn-{id}");
+            let (run, attempt) = (format!("run-{id}"), format!("attempt-{id}"));
             let running = matches!(*state, "working" | "blocked");
+            let status = if running { "running" } else { "completed" };
+            transaction.execute("INSERT INTO orchestration_v2_projection_threads VALUES (?1, ?1, NULL)", [id]).unwrap();
             transaction
                 .execute(
-                    "INSERT INTO projection_threads(thread_id,title,pending_approval_count) VALUES (?1,?1,?2)",
-                    rusqlite::params![id, *state == "blocked"],
+                    "INSERT INTO orchestration_v2_projection_runs VALUES (?1, ?2, 1, 'codex', ?3, ?4)",
+                    rusqlite::params![run, id, status, serde_json::json!({"activeAttemptId": attempt}).to_string()],
                 )
                 .unwrap();
             transaction
                 .execute(
-                    "INSERT INTO projection_thread_sessions VALUES (?1,?2,?3)",
-                    rusqlite::params![id, if running { "running" } else { "ready" }, turn],
+                    "INSERT INTO orchestration_v2_projection_run_attempts VALUES (?1, ?2, ?3)",
+                    rusqlite::params![attempt, run, status],
                 )
                 .unwrap();
             transaction
                 .execute(
-                    "INSERT INTO provider_session_runtime VALUES (?1,'codex','running',?2,?3)",
-                    rusqlite::params![id, STARTED_AT, serde_json::json!({"activeTurnId":turn}).to_string()],
+                    "INSERT INTO orchestration_v2_projection_provider_turns VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![format!("turn-{id}"), attempt, status, STARTED_AT],
                 )
                 .unwrap();
-            transaction
-                .execute(
-                    "INSERT INTO projection_turns(thread_id,turn_id,state) VALUES (?1,?2,?3)",
-                    rusqlite::params![id, turn, if running { "running" } else { "completed" }],
-                )
-                .unwrap();
+            if *state == "blocked" {
+                transaction
+                    .execute(
+                        "INSERT INTO orchestration_v2_projection_nodes VALUES (?1, ?2)",
+                        rusqlite::params![format!("node-{id}"), run],
+                    )
+                    .unwrap();
+                transaction
+                    .execute(
+                        "INSERT INTO orchestration_v2_projection_runtime_requests VALUES (?1, ?1, 'command', 'pending')",
+                        [format!("node-{id}")],
+                    )
+                    .unwrap();
+            }
         }
         transaction.commit().unwrap();
     }
@@ -338,11 +353,30 @@ fn an_incompatible_database_releases_and_recovers_without_restart() {
     h.set_threads(&[("thread", "working")]);
     h.run(&["start"]);
     h.wait_for("the hold", holding);
-    h.database.execute_batch("ALTER TABLE projection_threads RENAME TO incompatible_threads;").unwrap();
+    h.database.execute_batch("ALTER TABLE orchestration_v2_projection_runs RENAME TO incompatible_runs;").unwrap();
     h.wait_for("the release", |s| s["hold"] == false && s["reason"] == "T3 unreadable");
     assert!(h.log().contains("database schema may have changed"));
-    h.database.execute_batch("ALTER TABLE incompatible_threads RENAME TO projection_threads;").unwrap();
+    h.database.execute_batch("ALTER TABLE incompatible_runs RENAME TO orchestration_v2_projection_runs;").unwrap();
     h.wait_for("the recovered hold", holding);
+}
+
+#[test]
+fn a_database_the_server_no_longer_uses_is_an_error_not_an_idle_server() {
+    let h = Harness::new("moved");
+    h.set_threads(&[("thread", "working")]);
+    // A frozen database from an older T3 still has every table its reader needs.
+    let frozen = Connection::open(h.dir.join("userdata/state.sqlite")).unwrap();
+    frozen.execute_batch(include_str!("fixtures/schema.sql")).unwrap();
+    drop(frozen);
+    h.run(&["start"]);
+    h.wait_for("the hold", holding);
+    let moved = h.dir.join("userdata/statev3.sqlite");
+    fs::rename(h.dir.join("userdata/statev2.sqlite"), &moved).unwrap();
+    let status = h.wait_for("the release", |s| s["hold"] == false && s["reason"] == "T3 unreadable");
+    assert!(status["t3_errors"][0].as_str().unwrap().contains("may have moved its database"), "{status}");
+    fs::rename(&moved, h.dir.join("userdata/statev2.sqlite")).unwrap();
+    h.wait_for("the recovered hold", holding);
+    assert!(h.log().contains("T3: readable again"));
 }
 
 #[test]
