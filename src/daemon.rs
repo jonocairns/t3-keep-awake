@@ -7,9 +7,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
+
+use crate::always_on::AlwaysOn;
 
 use crate::config::{Config, MAX_SNAPSHOT_AGE};
 use crate::decide::{Decision, Tracker};
@@ -30,6 +32,8 @@ const RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
 const STABLE_AFTER: Duration = Duration::from_secs(60);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 const SOCKET_IO_TIMEOUT: Duration = Duration::from_secs(2);
+/// A T3 poll can take a few seconds; clients wait 5s for a reply.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(4);
 
 static STOP_SIGNALLED: AtomicBool = AtomicBool::new(false);
 
@@ -37,6 +41,8 @@ enum Msg {
     Nudge,
     Stop,
     KeeperLine(u64, String),
+    /// Turn always-on on (`Some`) or off, then reply once it is saved.
+    SetAlwaysOn(Option<AlwaysOn>, Sender<String>),
 }
 
 pub fn run() -> Result<()> {
@@ -70,7 +76,7 @@ pub fn run() -> Result<()> {
 
     *status.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
         Status { daemon_pid: process::id(), reason: "reading T3".into(), ..Status::default() };
-    let mut daemon = Daemon::new(config, log, tx.clone(), Arc::clone(&status))?;
+    let mut daemon = Daemon::new(config, log, tx.clone(), Arc::clone(&status), &paths)?;
     spawn_listener(listener, tx, status);
     // Serve clients promptly even when the first T3 snapshot is slow.
     daemon.tick(Instant::now());
@@ -133,10 +139,34 @@ fn serve(stream: &UnixStream, tx: &Sender<Msg>, status: &Mutex<Status>) -> io::R
             let status = status.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             serde_json::to_string(&*status).unwrap_or_else(|error| format!("error {error}"))
         }
-        other => format!("error unknown request {other:?}"),
+        other => match parse_always_on(other) {
+            Some(Ok(always_on)) => {
+                let (reply_tx, reply_rx) = mpsc::channel();
+                let _ = tx.send(Msg::SetAlwaysOn(always_on, reply_tx));
+                reply_rx.recv_timeout(REPLY_TIMEOUT).unwrap_or_else(|_| "error daemon did not answer in time".into())
+            }
+            Some(Err(error)) => format!("error {error}"),
+            None => format!("error unknown request {other:?}"),
+        },
     };
     let mut stream = stream;
     stream.write_all(format!("{reply}\n").as_bytes())
+}
+
+/// `always-on` (until turned off), `always-on SECS`, or `always-off`.
+fn parse_always_on(request: &str) -> Option<Result<Option<AlwaysOn>, String>> {
+    let mut words = request.split_whitespace();
+    let parsed = match (words.next()?, words.next(), words.next()) {
+        ("always-off", None, None) => Ok(None),
+        ("always-on", None, None) => Ok(Some(AlwaysOn::starting(SystemTime::now(), None))),
+        ("always-on", Some(secs), None) => match secs.parse::<u64>() {
+            Ok(secs) if secs > 0 => Ok(Some(AlwaysOn::starting(SystemTime::now(), Some(Duration::from_secs(secs))))),
+            _ => Err(format!("invalid always-on duration {secs:?}")),
+        },
+        ("always-on" | "always-off", ..) => Err(format!("invalid request {request:?}")),
+        _ => return None,
+    };
+    Some(parsed)
 }
 
 enum Step {
@@ -151,6 +181,8 @@ struct Daemon {
     config: Config,
     t3: T3,
     log: Log,
+    always_on_path: std::path::PathBuf,
+    always_on: Option<AlwaysOn>,
     tx: Sender<Msg>,
     status: Arc<Mutex<Status>>,
     started: Instant,
@@ -169,13 +201,28 @@ struct Daemon {
 }
 
 impl Daemon {
-    fn new(config: Config, log: Log, tx: Sender<Msg>, status: Arc<Mutex<Status>>) -> Result<Self> {
+    fn new(config: Config, log: Log, tx: Sender<Msg>, status: Arc<Mutex<Status>>, paths: &Paths) -> Result<Self> {
         let now = Instant::now();
         let t3 = T3::from_config(&config)?;
+        let always_on_path = paths.always_on();
+        // A damaged file must not keep Windows awake; `on` or `off` rewrites it.
+        let always_on = match AlwaysOn::load(&always_on_path) {
+            Ok(Some(always_on)) if !always_on.expired(SystemTime::now()) => {
+                log.line(format!("{}: restored", always_on.describe(SystemTime::now())));
+                Some(always_on)
+            }
+            Ok(_) => None,
+            Err(error) => {
+                log.line(format!("ignoring always-on setting: {error:#}"));
+                None
+            }
+        };
         Ok(Self {
             config,
             t3,
             log,
+            always_on_path,
+            always_on,
             tx,
             status,
             started: now,
@@ -207,6 +254,9 @@ impl Daemon {
                     return Ok(());
                 }
                 Ok(Msg::KeeperLine(generation, line)) => self.on_keeper_line(generation, &line),
+                Ok(Msg::SetAlwaysOn(always_on, reply)) => {
+                    let _ = reply.send(self.set_always_on(always_on));
+                }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => bail!("message channel closed"),
             }
@@ -220,13 +270,54 @@ impl Daemon {
             self.poll();
         }
         let now = Instant::now();
-        let (decision, expired) = current_decision(&self.decision, self.last_poll, now);
-        if expired && !self.snapshot_expired {
+        let (mut decision, expired) = current_decision(&self.decision, self.last_poll, now);
+        if expired && !self.snapshot_expired && self.always_on.is_none() {
             self.log.line("release: T3 snapshot stale");
         }
         self.snapshot_expired = expired;
+        let wall = SystemTime::now();
+        if self.always_on.is_some_and(|always_on| always_on.expired(wall)) {
+            self.always_on = None;
+            if let Err(error) = AlwaysOn::clear(&self.always_on_path) {
+                self.log.line(format!("{error:#}"));
+            }
+            self.log.line(format!("always on: ended; {}", self.automatic_reason(&decision)));
+        }
+        // The status mode line carries the details.
+        if self.always_on.is_some() {
+            decision.hold = true;
+            decision.reason = "always on".into();
+        }
         self.reconcile(now, decision.hold);
         self.publish_status(now, &decision);
+    }
+
+    /// Saves before applying, so what `status` reports is what a restart restores.
+    fn set_always_on(&mut self, always_on: Option<AlwaysOn>) -> String {
+        let saved = match always_on {
+            Some(always_on) => always_on.save(&self.always_on_path),
+            None => AlwaysOn::clear(&self.always_on_path),
+        };
+        if let Err(error) = saved {
+            self.log.line(format!("always on: {error:#}"));
+            return format!("error {error:#}");
+        }
+        let was_on = self.always_on.is_some();
+        self.always_on = always_on;
+        match always_on {
+            Some(always_on) => self.log.line(format!("{}: requested", always_on.describe(SystemTime::now()))),
+            None if was_on => {
+                self.log.line(format!("always on: turned off; {}", self.automatic_reason(&self.decision)))
+            }
+            None => {}
+        }
+        self.tick(Instant::now());
+        "ok".to_string()
+    }
+
+    fn automatic_reason(&self, decision: &Decision) -> String {
+        let verb = if decision.hold { "holding" } else { "releasing" };
+        format!("{verb}: {}", decision.reason)
     }
 
     fn poll_due(&self, now: Instant) -> bool {
@@ -273,7 +364,13 @@ impl Daemon {
             self.tracker.observe(&snapshot.threads, snapshot.complete(), now, &self.config)
         };
         if decision.hold != self.decision.hold || (decision.hold && self.snapshot_expired) {
-            let verb = if decision.hold { "hold" } else { "release" };
+            // Always-on holds regardless, so T3's own verdict is only informational.
+            let verb = match (self.always_on.is_some(), decision.hold) {
+                (true, true) => "T3 would hold",
+                (true, false) => "T3 would release",
+                (false, true) => "hold",
+                (false, false) => "release",
+            };
             self.log.line(format!("{verb}: {}", decision.reason));
         }
         if decision.active != self.decision.active && !decision.active.is_empty() {
@@ -463,6 +560,12 @@ impl Daemon {
             t3_warnings: self.t3_warnings.clone(),
             keeper_failures: self.failures,
             retry_in_secs: self.retry_at.filter(|at| *at > now).map(|at| at.duration_since(now).as_secs()),
+            always_on: self.always_on.is_some(),
+            always_on_until: self.always_on.and_then(|always_on| always_on.until_timestamp()),
+            always_on_left_secs: self
+                .always_on
+                .and_then(|always_on| always_on.left(SystemTime::now()))
+                .map(|left| left.as_secs()),
         };
         *self.status.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = status;
     }

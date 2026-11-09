@@ -31,6 +31,34 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month, day)
 }
 
+/// Parse `90m`, `2h`, `1h30m`, `45s`, or `1d`. A bare number is rejected:
+/// minutes and hours are both plausible readings.
+pub fn parse_duration(text: &str) -> Result<Duration, String> {
+    let invalid = || format!("invalid duration {text:?}; use a number and unit, such as 90m, 2h, or 1h30m");
+    let mut total: u64 = 0;
+    let mut digits = String::new();
+    for c in text.trim().chars() {
+        if c.is_ascii_digit() {
+            digits.push(c);
+            continue;
+        }
+        let unit = match c {
+            's' => 1,
+            'm' => 60,
+            'h' => 3600,
+            'd' => 86_400,
+            _ => return Err(invalid()),
+        };
+        let n: u64 = digits.parse().map_err(|_| invalid())?;
+        total = n.checked_mul(unit).and_then(|secs| total.checked_add(secs)).ok_or_else(invalid)?;
+        digits.clear();
+    }
+    if !digits.is_empty() || total == 0 {
+        return Err(invalid());
+    }
+    Ok(Duration::from_secs(total))
+}
+
 pub fn truncate(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
@@ -56,6 +84,18 @@ mod tests {
         assert_eq!(timestamp(UNIX_EPOCH), "1970-01-01T00:00:00Z");
         assert_eq!(timestamp(UNIX_EPOCH + Duration::from_secs(1_700_000_000)), "2023-11-14T22:13:20Z");
         assert_eq!(timestamp(UNIX_EPOCH + Duration::from_secs(951_782_400)), "2000-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn durations_parse_with_units_only() {
+        assert_eq!(parse_duration("90m"), Ok(Duration::from_secs(5400)));
+        assert_eq!(parse_duration("1h30m"), Ok(Duration::from_secs(5400)));
+        assert_eq!(parse_duration("2h"), Ok(Duration::from_secs(7200)));
+        assert_eq!(parse_duration("45s"), Ok(Duration::from_secs(45)));
+        assert_eq!(parse_duration("1d"), Ok(Duration::from_secs(86_400)));
+        for bad in ["", "90", "0m", "h", "1x", "-1h", "1.5h", "99999999999999999999d"] {
+            assert!(parse_duration(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

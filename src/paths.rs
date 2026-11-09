@@ -31,6 +31,10 @@ impl Paths {
     pub fn log(&self) -> PathBuf {
         self.dir.join("daemon.log")
     }
+
+    pub fn always_on(&self) -> PathBuf {
+        self.dir.join("always-on.json")
+    }
 }
 
 pub fn config_file() -> Result<PathBuf> {

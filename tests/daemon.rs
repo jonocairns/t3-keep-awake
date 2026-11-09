@@ -432,3 +432,73 @@ fn a_runtime_pid_that_does_not_own_the_listener_is_ignored() {
     unrelated.kill().unwrap();
     unrelated.wait().unwrap();
 }
+
+#[test]
+fn always_on_holds_without_t3_survives_a_restart_and_off_releases() {
+    let h = Harness::new("always-on");
+    h.set_server_running(false);
+    h.run(&["start"]);
+    h.wait_for("the absent server", |s| s["reason"] == "T3 server not running");
+    let on = String::from_utf8(h.run(&["on"]).stdout).unwrap();
+    assert!(on.contains("mode     always on until `t3-keep-awake off`"), "{on}");
+    let first = h.wait_for("the always-on hold", |s| holding(s) && s["always_on"] == true);
+    assert_eq!(first["reason"], "always on");
+    h.run(&["restart"]);
+    h.wait_for_keeper_exit(keeper_pid(&first));
+    let restored = h.wait_for("the restored hold", |s| holding(s) && s["daemon_pid"] != first["daemon_pid"]);
+    assert_eq!(restored["always_on"], true);
+    assert!(h.log().contains("always on until turned off: restored"));
+    let off = String::from_utf8(h.run(&["off"]).stdout).unwrap();
+    assert!(off.contains("mode     automatic"), "{off}");
+    h.wait_for("the release", |s| s["hold"] == false && s["keeper"].is_null());
+    h.wait_for_keeper_exit(keeper_pid(&restored));
+    assert!(!h.dir.join("state/always-on.json").exists());
+}
+
+#[test]
+fn a_timed_always_on_lapses_back_to_automatic() {
+    let h = Harness::new("always-on-timed");
+    h.run(&["start"]);
+    h.run(&["on", "3s"]);
+    let status = h.wait_for("the timed hold", |s| holding(s) && s["always_on_until"].is_string());
+    assert_eq!(status["reason"], "always on");
+    assert!(status["always_on_left_secs"].as_u64().unwrap() <= 3, "{status}");
+    h.wait_for("the lapse", |s| s["hold"] == false && s["always_on"] == false && s["keeper"].is_null());
+    assert!(h.log().contains("always on: ended; releasing: no threads working"), "{}", h.log());
+    let error = h.command(&["on", "90"]).output().unwrap();
+    assert!(!error.status.success());
+    assert!(String::from_utf8_lossy(&error.stderr).contains("invalid duration"));
+}
+
+#[test]
+fn the_mcp_tools_drive_the_daemon() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let h = Harness::new("mcp");
+    h.run(&["start"]);
+    let mut server = h.command(&["mcp"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    let mut stdin = server.stdin.take().unwrap();
+    let mut stdout = BufReader::new(server.stdout.take().unwrap());
+    let mut send = |message: Value| -> Value {
+        writeln!(stdin, "{message}").unwrap();
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    };
+    let call = |name: &str, arguments: Value| {
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                           "params": {"name": name, "arguments": arguments}})
+    };
+    let init = send(serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}));
+    assert_eq!(init["result"]["serverInfo"]["name"], "t3-keep-awake");
+    let on = send(call("always_on", serde_json::json!({"duration": "2h"})));
+    assert_eq!(on["result"]["isError"], false, "{on}");
+    assert!(on["result"]["content"][0]["text"].as_str().unwrap().contains("mode     always on for "), "{on}");
+    h.wait_for("the hold", |s| holding(s) && s["always_on"] == true);
+    let off = send(call("always_off", serde_json::json!({})));
+    assert!(off["result"]["content"][0]["text"].as_str().unwrap().contains("mode     automatic"), "{off}");
+    h.wait_for("the release", |s| s["hold"] == false && s["keeper"].is_null());
+    drop(stdin);
+    assert!(server.wait().unwrap().success());
+}

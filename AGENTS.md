@@ -5,7 +5,8 @@ Capture durable conventions and recurring pitfalls here when they help future ag
 - Release binaries are static x86_64 Linux builds for WSL. Tag a commit on `main` whose Cargo version matches the tag; the release workflow validates and publishes the binary and checksum from that immutable checkout.
 - After changes run `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, and `cargo test`. Build the release binary, then use `t3-keep-awake restart` so the installed service picks up changes.
 - T3's SQLite projections are an internal interface. Open them read-only, retain WAL visibility, and treat missing tables or columns as errors. Never migrate, repair, or write to T3's database.
-- A T3 migration newer than `VERIFIED_MIGRATION` is a warning, not an error: it must not release a hold. Raise the constant only after checking the new schema's states and payloads against the reader.
+- Choose T3's database by the file the live server process holds open, not by which files exist. T3 v2 moved from `state.sqlite` to `statev2.sqlite` and left the old file frozen but readable; reading it silently reported no work for weeks. A server holding no known database is an error.
+- A T3 migration newer than a store's verified migration is a warning, not an error: it must not release a hold. Raise the constant only after checking the new schema's states and payloads against the reader.
 - Count current active AI turns, not the presence of T3 or a provider process. Join the session's active-turn ID to a running turn and matching provider runtime from the current server lifetime.
 - Confirm that the runtime PID owns the listening socket and answers HTTP before trusting persisted running state. A stopped or unresponsive server must release on the next poll.
 - Pending async user questions can coexist with work. They must not hide an otherwise running turn; classify pending permission approvals through the explicit blocked policy.
@@ -13,7 +14,7 @@ Capture durable conventions and recurring pitfalls here when they help future ag
 - A read error can preserve an existing hold only through the grace period. Never authorize a hold from a snapshot older than 60 seconds. Bound database waits and HTTP checks.
 - Use stable server and turn identities for stuck timers. Repeated observations must not reset an uninterrupted turn's timer.
 - Keep the installed daemon supervised by its systemd user service. Route CLI start/stop/restart through systemd; isolated state directories use the manual controller for tests.
-- Fail toward letting Windows sleep. New failure paths must release the hold or expire it within a bounded grace period.
+- Fail toward letting Windows sleep. New failure paths must release the hold or expire it within a bounded grace period. Always-on (`on`/`off`, the MCP tools) is the one deliberate hold without T3 work: it is persisted, still goes through the keeper heartbeat, and an unreadable setting file counts as off.
 - Rotate logs while running and preserve the current inode when rotating because the keeper's stderr is a cloned file handle.
 - Windows PowerShell 5.1 parses large hexadecimal flags as negative Int32 values; pass decimal uint flags.
 - `[Console]::In.ReadLineAsync()` blocks on PowerShell 5.1. Use a StreamReader over the raw stdin stream so the heartbeat timeout works.

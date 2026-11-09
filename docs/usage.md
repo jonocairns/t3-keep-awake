@@ -44,6 +44,8 @@ T3_KEEP_AWAKE_BINARY="$PWD/target/release/t3-keep-awake" sh ./install.sh
 ```sh
 t3-keep-awake status        # desired hold, confirmed keeper, active turns, errors
 t3-keep-awake status --json # the same state as JSON
+t3-keep-awake on [DURATION] # keep Windows awake regardless of T3
+t3-keep-awake off           # back to automatic
 t3-keep-awake log 30        # recent transitions and errors
 t3-keep-awake probe         # Windows' system-wide view, no administrator needed
 t3-keep-awake stop          # stop the service and release its sleep request
@@ -55,6 +57,43 @@ Installed lifecycle commands use systemd so the daemon remains supervised. To
 run without installation, use `cargo run -- daemon` in the foreground.
 `T3_KEEP_AWAKE_STATE_DIR` selects isolated/manual state and disables service
 routing for lifecycle commands.
+
+### Always on
+
+`t3-keep-awake on` keeps Windows awake whatever T3 is doing, until
+`t3-keep-awake off`. It is saved in `~/.local/state/t3-keep-awake/always-on.json`,
+so it survives `restart`, WSL restarts, and reboots (once WSL is running again).
+`t3-keep-awake on 2h` (or `90m`, `1h30m`, `1d`) ends by itself after that long,
+including if the time runs out while the daemon is stopped. Running `on` again
+replaces the previous setting. `off` returns to holding only while T3 threads
+work. `stop` still releases everything until the next `start`.
+
+Always-on uses the same keeper as automatic holds, so the display can still turn
+off and lock, and the keeper still lets go if the daemon dies. `status` shows the
+mode, and how long a timed hold has left.
+
+### MCP
+
+`t3-keep-awake mcp` is a stdio MCP server with three tools: `status`,
+`always_on` (optional `duration`, such as `"2h"`), and `always_off`. It talks to
+the running daemon, starting it if needed. For example, in a Claude Code
+`.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "keep-awake": { "command": "/home/you/.local/bin/t3-keep-awake", "args": ["mcp"] }
+  }
+}
+```
+
+or in Codex's `config.toml`:
+
+```toml
+[mcp_servers.keep-awake]
+command = "/home/you/.local/bin/t3-keep-awake"
+args = ["mcp"]
+```
 
 The probe reports the union of all Windows processes' power requests. Its output
 alone does not prove which process is holding Windows awake; `status` reports
