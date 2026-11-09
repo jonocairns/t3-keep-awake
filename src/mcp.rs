@@ -124,8 +124,8 @@ fn call(params: &Value, backend: &impl Backend) -> Value {
     let outcome = match params.get("name").and_then(Value::as_str) {
         Some("status") => backend.status(),
         Some("always_on") => match arguments.get("duration") {
+            // An explicit but unusable duration must not turn into "forever".
             None | Some(Value::Null) => backend.always_on(None),
-            Some(Value::String(text)) if text.trim().is_empty() => backend.always_on(None),
             Some(Value::String(text)) => {
                 parse_duration(text).map_err(|error| anyhow!(error)).and_then(|d| backend.always_on(Some(d)))
             }
@@ -215,6 +215,8 @@ mod tests {
         assert_eq!(bad["isError"], true);
         assert!(bad["content"][0]["text"].as_str().unwrap().contains("invalid duration"));
         assert_eq!(call_tool(&fake, "always_on", json!({"duration": 90}))["isError"], true);
+        assert_eq!(call_tool(&fake, "always_on", json!({"duration": ""}))["isError"], true);
+        assert_eq!(call_tool(&fake, "always_on", json!({"duration": " "}))["isError"], true);
         assert_eq!(call_tool(&fake, "always_off", json!({}))["content"][0]["text"], "daemon is not running");
         assert_eq!(call_tool(&fake, "reboot", json!({}))["isError"], true);
         assert_eq!(fake.calls.borrow().len(), 0, "nothing reached the backend");
