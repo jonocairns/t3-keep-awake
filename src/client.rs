@@ -94,9 +94,11 @@ pub fn always_off() -> Result<String> {
     set_mode("always-off")
 }
 
+/// Starts the daemon only when it is not running: a refresh would make the
+/// daemon read T3 just before it has to answer this request.
 fn set_mode(command: &str) -> Result<String> {
     let paths = Paths::resolve()?;
-    if request(&paths, "nudge").is_err() {
+    if UnixStream::connect(paths.socket()).is_err() {
         nudge()?;
     }
     request(&paths, command)?;

@@ -17,6 +17,9 @@ use crate::util::truncate;
 
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const DATABASE_TIMEOUT: Duration = Duration::from_millis(500);
+/// A database written this recently, with no runtime file, is worth asking
+/// about. Older ones belong to a T3 that has simply stopped.
+const RECENT_WRITE: Duration = Duration::from_secs(10 * 60);
 
 /// The T3 databases this reader understands, newest first. T3 moved from
 /// `state.sqlite` to `statev2.sqlite` with its v2 orchestrator and left the old
@@ -49,7 +52,7 @@ impl Store {
     fn read_threads(self, connection: &Connection, server_id: &str, started_at: &str) -> Result<Vec<Thread>> {
         match self {
             Store::V2 => read_threads_v2(connection, server_id, started_at),
-            Store::Legacy => read_threads(connection, server_id, started_at),
+            Store::Legacy => read_threads_legacy(connection, server_id, started_at),
         }
     }
 }
@@ -60,6 +63,9 @@ pub struct Snapshot {
     pub errors: Vec<String>,
     /// Problems that do not invalidate the read, such as a newer T3 schema.
     pub warnings: Vec<String>,
+    /// Set when T3 looks alive but its runtime file is missing. Unlike
+    /// `warnings`, every poll recomputes it, including offline ones.
+    pub runtime_warning: Option<String>,
 }
 
 impl Snapshot {
@@ -68,7 +74,13 @@ impl Snapshot {
     }
 
     fn offline() -> Self {
-        Self { running_servers: 0, threads: Vec::new(), errors: Vec::new(), warnings: Vec::new() }
+        Self {
+            running_servers: 0,
+            threads: Vec::new(),
+            errors: Vec::new(),
+            warnings: Vec::new(),
+            runtime_warning: None,
+        }
     }
 }
 
@@ -106,6 +118,7 @@ impl T3 {
                 threads: Vec::new(),
                 errors: vec![format!("{}: {error:#}", self.data_dir.display())],
                 warnings: Vec::new(),
+                runtime_warning: None,
             },
         }
     }
@@ -113,7 +126,10 @@ impl T3 {
     fn read(&self) -> Result<Snapshot> {
         let text = match fs::read(self.data_dir.join("server-runtime.json")) {
             Ok(text) => text,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Snapshot::offline()),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                let runtime_warning = orphaned_database(&self.data_dir, Path::new("/proc"), std::process::id());
+                return Ok(Snapshot { runtime_warning, ..Snapshot::offline() });
+            }
             Err(error) => return Err(error).context("reading server-runtime.json"),
         };
         let runtime: Runtime = serde_json::from_slice(&text).context("parsing server-runtime.json")?;
@@ -143,8 +159,54 @@ impl T3 {
         if listening_process(&runtime, Path::new("/proc"))? != Some(process_start) {
             return Ok(Snapshot::offline());
         }
-        Ok(Snapshot { running_servers: 1, threads, errors: Vec::new(), warnings })
+        Ok(Snapshot { running_servers: 1, threads, errors: Vec::new(), warnings, runtime_warning: None })
     }
+}
+
+/// With no runtime file, T3 is normally stopped. If a recently written T3
+/// database is still open in some process, T3 is more likely running with its
+/// runtime file somewhere this reader does not look, which would otherwise
+/// read as "stopped" forever. Only a diagnostic: it never authorizes a hold.
+fn orphaned_database(data_dir: &Path, proc_dir: &Path, own_pid: u32) -> Option<String> {
+    let recent = |path: &Path| {
+        fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age < RECENT_WRITE))
+    };
+    let databases: Vec<_> = Store::ALL
+        .into_iter()
+        .filter(|store| {
+            let path = data_dir.join(store.file());
+            recent(&path) || recent(&data_dir.join(format!("{}-wal", store.file())))
+        })
+        .filter_map(|store| {
+            let metadata = fs::metadata(data_dir.join(store.file())).ok()?;
+            Some((store, (metadata.dev(), metadata.ino())))
+        })
+        .collect();
+    if databases.is_empty() {
+        return None;
+    }
+    for process in fs::read_dir(proc_dir).ok()?.flatten() {
+        let Some(pid) = process.file_name().to_str().and_then(|name| name.parse::<u32>().ok()) else { continue };
+        // Other users' processes are unreadable, which is fine: T3 runs as us.
+        let Ok(descriptors) = fs::read_dir(process.path().join("fd")) else { continue };
+        if pid == own_pid {
+            continue;
+        }
+        for descriptor in descriptors.flatten() {
+            let Ok(metadata) = fs::metadata(descriptor.path()) else { continue };
+            let open = (metadata.dev(), metadata.ino());
+            if let Some((store, _)) = databases.iter().find(|(_, id)| *id == open) {
+                return Some(format!(
+                    "{} is open in pid {pid} but server-runtime.json is missing; T3 may have moved its runtime \
+                     file, so working turns would go undetected",
+                    store.file()
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// Pick the store whose database file the T3 server process has open. A
@@ -173,7 +235,8 @@ fn open_store(data_dir: &Path, pid: u32, proc_dir: &Path) -> Result<Store> {
 /// run attempt, and the provider's own work as provider turns. A run counts
 /// while its active attempt has a running provider turn started in this
 /// server's lifetime. A run that has `waiting` status is finalizing after its
-/// turn completed, and queued or preparing runs have no provider work yet.
+/// turn completed, and queued, preparing, or starting runs have no provider
+/// work yet.
 fn read_threads_v2(connection: &Connection, server_id: &str, started_at: &str) -> Result<Vec<Thread>> {
     // Permission requests (T3's ProviderRequestKind) mark a run as blocked.
     // Questions, MCP elicitations, and tool callbacks can coexist with work.
@@ -195,6 +258,13 @@ fn read_threads_v2(connection: &Connection, server_id: &str, started_at: &str) -
              ORDER BY t.thread_id, r.ordinal",
         )
         .context("reading T3 thread state (the database schema may have changed)")?;
+    // Runs are numbered per thread; a steering restart or retry is a new
+    // attempt of the same run and keeps its stuck timer.
+    collect_threads(&mut query, server_id, started_at)
+}
+
+/// Both readers select `thread_id, title, provider, turn identity, blocked`.
+fn collect_threads(query: &mut rusqlite::Statement, server_id: &str, started_at: &str) -> Result<Vec<Thread>> {
     let threads = query.query_map([started_at], |row| {
         let id: String = row.get(0)?;
         let title: String = row.get(1)?;
@@ -204,8 +274,6 @@ fn read_threads_v2(connection: &Connection, server_id: &str, started_at: &str) -
             id: format!("{server_id}/{id}"),
             label: format!("{} {provider} \"{}\"", truncate(&id, 8), truncate(&title, 48)),
             status: if blocked { ThreadStatus::Blocked } else { ThreadStatus::Working },
-            // Runs are numbered per thread; a steering restart or retry is a
-            // new attempt of the same run and keeps its stuck timer.
             seq: u64::try_from(row.get::<_, i64>(3)?).map_err(|error| {
                 rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Integer, Box::new(error))
             })?,
@@ -214,7 +282,7 @@ fn read_threads_v2(connection: &Connection, server_id: &str, started_at: &str) -
     threads.collect::<rusqlite::Result<_>>().context("decoding T3 thread state")
 }
 
-fn read_threads(connection: &Connection, server_id: &str, started_at: &str) -> Result<Vec<Thread>> {
+fn read_threads_legacy(connection: &Connection, server_id: &str, started_at: &str) -> Result<Vec<Thread>> {
     // Only a current running turn confirmed by this live server counts. Old
     // turns, idle provider processes, deleted threads, and pre-restart runtime
     // rows do not. Async user questions can coexist with active work; only a
@@ -234,21 +302,7 @@ fn read_threads(connection: &Connection, server_id: &str, started_at: &str) -> R
              ORDER BY t.thread_id",
         )
         .context("reading T3 thread state (the database schema may have changed)")?;
-    let threads = query.query_map([started_at], |row| {
-        let id: String = row.get(0)?;
-        let title: String = row.get(1)?;
-        let provider: String = row.get(2)?;
-        let blocked: bool = row.get(4)?;
-        Ok(Thread {
-            id: format!("{server_id}/{id}"),
-            label: format!("{} {provider} \"{}\"", truncate(&id, 8), truncate(&title, 48)),
-            status: if blocked { ThreadStatus::Blocked } else { ThreadStatus::Working },
-            seq: u64::try_from(row.get::<_, i64>(3)?).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Integer, Box::new(error))
-            })?,
-        })
-    })?;
-    threads.collect::<rusqlite::Result<_>>().context("decoding T3 thread state")
+    collect_threads(&mut query, server_id, started_at)
 }
 
 /// A newer schema can still satisfy the query while renaming the states it
@@ -380,7 +434,7 @@ mod tests {
     }
 
     fn threads(connection: &Connection) -> Vec<Thread> {
-        read_threads(connection, "server", "2026-10-03T09:00:00.000Z").unwrap()
+        read_threads_legacy(connection, "server", "2026-10-03T09:00:00.000Z").unwrap()
     }
 
     #[test]
@@ -439,7 +493,7 @@ mod tests {
         let next = threads(&connection).remove(0);
         assert_eq!(first.id, next.id);
         assert_ne!(first.seq, next.seq);
-        let restarted = read_threads(&connection, "restarted-server", "2026-10-03T09:00:00.000Z").unwrap();
+        let restarted = read_threads_legacy(&connection, "restarted-server", "2026-10-03T09:00:00.000Z").unwrap();
         assert_ne!(next.id, restarted[0].id);
     }
 
@@ -634,6 +688,27 @@ mod tests {
     }
 
     #[test]
+    fn a_recent_database_held_open_without_a_runtime_file_is_flagged() {
+        let fake = FakeProc::new("orphan");
+        let proc_dir = fake.root.join("proc");
+        assert_eq!(orphaned_database(&fake.userdata(), &proc_dir, 1), None, "no database at all");
+        fake.create("statev2.sqlite");
+        assert_eq!(orphaned_database(&fake.userdata(), &proc_dir, 1), None, "written recently, but nobody has it open");
+        fake.hold_open(3, "statev2.sqlite");
+        let warning = orphaned_database(&fake.userdata(), &proc_dir, 1).unwrap();
+        assert!(warning.contains("statev2.sqlite is open in pid 7"), "{warning}");
+        assert_eq!(orphaned_database(&fake.userdata(), &proc_dir, 7), None, "the daemon's own handles do not count");
+        let old = std::time::SystemTime::now() - RECENT_WRITE - Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(fake.userdata().join("statev2.sqlite"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        assert_eq!(orphaned_database(&fake.userdata(), &proc_dir, 1), None, "a long-stopped T3 is not flagged");
+    }
+
+    #[test]
     fn a_frozen_old_database_is_not_read_when_the_server_moved_on() {
         let fake = FakeProc::new("moved");
         fake.create("state.sqlite");
@@ -671,7 +746,7 @@ mod tests {
     #[test]
     fn schema_changes_are_reported_as_errors() {
         let connection = Connection::open_in_memory().unwrap();
-        let error = read_threads(&connection, "server", "2026-10-03T09:00:00.000Z").unwrap_err();
+        let error = read_threads_legacy(&connection, "server", "2026-10-03T09:00:00.000Z").unwrap_err();
         assert!(error.to_string().contains("database schema may have changed"));
     }
 }

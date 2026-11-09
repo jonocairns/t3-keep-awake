@@ -63,8 +63,10 @@ routing for lifecycle commands.
 `t3-keep-awake on` keeps Windows awake whatever T3 is doing, until
 `t3-keep-awake off`. It is saved in `~/.local/state/t3-keep-awake/always-on.json`,
 so it survives `restart`, WSL restarts, and reboots (once WSL is running again).
-`t3-keep-awake on 2h` (or `90m`, `1h30m`, `1d`) ends by itself after that long,
-including if the time runs out while the daemon is stopped. Running `on` again
+`t3-keep-awake on 2h` (or `90m`, `1h30m`, `1d`, up to 366 days) ends by itself
+after that long, including if the time runs out while the daemon is stopped. The
+end time is a wall-clock time, so if WSL's clock falls behind after Windows
+sleeps, a timed hold can run long by the same amount. Running `on` again
 replaces the previous setting. `off` returns to holding only while T3 threads
 work. `stop` still releases everything until the next `start`.
 
@@ -76,7 +78,8 @@ mode, and how long a timed hold has left.
 
 `t3-keep-awake mcp` is a stdio MCP server with three tools: `status`,
 `always_on` (optional `duration`, such as `"2h"`), and `always_off`. It talks to
-the running daemon, starting it if needed. For example, in a Claude Code
+the running daemon: `always_on` and `always_off` start it if needed, and
+`status` reports an error if it is not running. For example, in a Claude Code
 `.mcp.json`:
 
 ```json
@@ -116,7 +119,7 @@ optional; unknown keys are rejected. Run `t3-keep-awake restart` after edits.
 | `t3_data_dir` | `~/.t3/userdata` | Absolute path to T3's WSL userdata directory containing `statev2.sqlite` (or `state.sqlite`) and `server-runtime.json`. |
 | `poll_secs` | `5` | Poll interval while T3 is running, a hold is wanted, or a read failed. Must be below 60 seconds. |
 | `idle_poll_secs` | `5` | How often to look for a returning T3 server. |
-| `grace_secs` | `30` | Hold this long after the last active turn, or a database read error. Set to `0` for immediate release. |
+| `grace_secs` | `30` | Hold this long after the last active turn, or a database read error. Read errors never hold more than 60 seconds past the last good read. Set to `0` for immediate release. |
 | `hold_blocked` | `false` | Count a running turn waiting on a permission approval. Async user questions alone do not classify a turn as blocked. |
 | `max_working_secs` | `28800` | Treat one turn running longer than eight hours as stuck. A new turn resets this timer. |
 | `keep_display_on` | `false` | Also keep the display on. |
@@ -150,7 +153,9 @@ It then reads whichever T3 database that server process has open:
 `state.sqlite`. T3 leaves the old file behind when it upgrades, still readable
 but frozen, so the server's open files rather than which files exist decide. If
 the server has neither open, T3 has moved its database: that is an error in
-`status` and the log, not a quiet "no threads working".
+`status` and the log, not a quiet "no threads working". Likewise, if
+`server-runtime.json` is missing but a recently written T3 database is still
+open in some process, `status` warns that T3 may have moved its runtime file.
 
 The database is opened **read-only**, preserving WAL visibility. With
 `statev2.sqlite`, a thread counts while its run is running, the run's active

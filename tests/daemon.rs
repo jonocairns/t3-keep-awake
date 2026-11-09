@@ -459,15 +459,92 @@ fn always_on_holds_without_t3_survives_a_restart_and_off_releases() {
 fn a_timed_always_on_lapses_back_to_automatic() {
     let h = Harness::new("always-on-timed");
     h.run(&["start"]);
-    h.run(&["on", "3s"]);
-    let status = h.wait_for("the timed hold", |s| holding(s) && s["always_on_until"].is_string());
-    assert_eq!(status["reason"], "always on");
-    assert!(status["always_on_left_secs"].as_u64().unwrap() <= 3, "{status}");
+    // `on` replies with the applied state, so this does not race the keeper.
+    let on: Value = {
+        h.run(&["on", "5s"]);
+        h.status().unwrap()
+    };
+    assert_eq!(on["hold"], true, "{on}");
+    assert_eq!(on["reason"], "always on");
+    assert!(on["always_on_left_secs"].as_u64().unwrap() <= 5, "{on}");
     h.wait_for("the lapse", |s| s["hold"] == false && s["always_on"] == false && s["keeper"].is_null());
     assert!(h.log().contains("always on: ended; releasing: no threads working"), "{}", h.log());
     let error = h.command(&["on", "90"]).output().unwrap();
     assert!(!error.status.success());
     assert!(String::from_utf8_lossy(&error.stderr).contains("invalid duration"));
+    let error = h.command(&["on", "400d"]).output().unwrap();
+    assert!(!error.status.success());
+    assert!(String::from_utf8_lossy(&error.stderr).contains("between 1s and 366 days"), "{error:?}");
+    assert!(!h.dir.join("state/always-on.json").exists(), "a refused duration saves nothing");
+}
+
+#[test]
+fn a_damaged_always_on_setting_counts_as_off() {
+    let h = Harness::new("always-on-damaged");
+    // `{}` would read as "until: None", hold forever, if parsed leniently.
+    fs::write(h.dir.join("state/always-on.json"), "{}").unwrap();
+    h.run(&["start"]);
+    let status = h.wait_for("the first snapshot", |s| s["running_servers"] == 1);
+    assert_eq!(status["always_on"], false, "{status}");
+    assert_eq!(status["hold"], false, "{status}");
+    assert!(h.log().contains("ignoring always-on setting"), "{}", h.log());
+    assert!(h.keeper_log().is_empty());
+}
+
+#[test]
+fn an_always_on_that_ended_while_stopped_is_cleared_at_start() {
+    let h = Harness::new("always-on-expired");
+    fs::write(h.dir.join("state/always-on.json"), "{\"until\": 1}").unwrap();
+    h.run(&["start"]);
+    h.wait_for("the first snapshot", |s| s["running_servers"] == 1 && s["hold"] == false);
+    assert!(!h.dir.join("state/always-on.json").exists());
+    assert!(h.log().contains("always on: ended while the daemon was stopped"));
+}
+
+#[test]
+fn off_hands_back_to_t3_without_dropping_a_working_turn() {
+    let h = Harness::new("always-on-off-working");
+    h.set_threads(&[("thread", "working")]);
+    h.run(&["start"]);
+    h.run(&["on"]);
+    let first = h.wait_for("the always-on hold", |s| holding(s) && s["always_on"] == true);
+    h.run(&["off"]);
+    let status = h.status().unwrap();
+    assert_eq!(status["always_on"], false);
+    assert_eq!(status["reason"], "1 thread working", "{status}");
+    assert_eq!(keeper_pid(&status), keeper_pid(&first), "the same keeper keeps holding");
+    assert!(h.log().contains("always on: turned off; holding: 1 thread working"), "{}", h.log());
+}
+
+#[test]
+fn an_always_on_that_cannot_be_saved_is_refused_not_half_applied() {
+    let h = Harness::new("always-on-unsaved");
+    // A directory where the setting file goes makes the save fail.
+    fs::create_dir_all(h.dir.join("state/always-on.json")).unwrap();
+    h.run(&["start"]);
+    h.wait_for("the first snapshot", |s| s["running_servers"] == 1);
+    let output = h.command(&["on"]).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("always-on.json"), "{output:?}");
+    let status = h.status().unwrap();
+    assert_eq!(status["always_on"], false, "{status}");
+    assert_eq!(status["hold"], false, "{status}");
+}
+
+#[test]
+fn a_t3_database_in_use_without_a_runtime_file_is_flagged() {
+    let h = Harness::new("runtime-moved");
+    h.run(&["start"]);
+    h.wait_for("the server", |s| s["running_servers"] == 1);
+    // The harness, standing in for T3, still has statev2.sqlite open.
+    h.set_server_running(false);
+    let status = h.wait_for("the warning", |s| {
+        s["t3_warnings"].as_array().is_some_and(|w| w.iter().any(|w| w.as_str().unwrap().contains("runtime file")))
+    });
+    assert_eq!(status["reason"], "T3 server not running", "only a diagnostic: {status}");
+    h.set_server_running(true);
+    h.wait_for("the cleared warning", |s| s["running_servers"] == 1 && s["t3_warnings"].as_array().unwrap().is_empty());
+    assert!(h.log().contains("T3: runtime-file warning cleared"));
 }
 
 #[test]

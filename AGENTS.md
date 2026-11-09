@@ -11,10 +11,10 @@ Capture durable conventions and recurring pitfalls here when they help future ag
 - Confirm that the runtime PID owns the listening socket and answers HTTP before trusting persisted running state. A stopped or unresponsive server must release on the next poll.
 - Pending async user questions can coexist with work. They must not hide an otherwise running turn; classify pending permission approvals through the explicit blocked policy.
 - Keep the controller level-triggered: every poll recomputes the hold from a full snapshot. Do not rely on observing one particular event.
-- A read error can preserve an existing hold only through the grace period. Never authorize a hold from a snapshot older than 60 seconds. Bound database waits and HTTP checks.
+- A read error can preserve an existing hold only through the grace period. Never authorize a hold from a snapshot older than 60 seconds; measure that from the last successful read, not the last attempt. Bound database waits and HTTP checks.
 - Use stable server and turn identities for stuck timers. Repeated observations must not reset an uninterrupted turn's timer.
 - Keep the installed daemon supervised by its systemd user service. Route CLI start/stop/restart through systemd; isolated state directories use the manual controller for tests.
-- Fail toward letting Windows sleep. New failure paths must release the hold or expire it within a bounded grace period. Always-on (`on`/`off`, the MCP tools) is the one deliberate hold without T3 work: it is persisted, still goes through the keeper heartbeat, and an unreadable setting file counts as off.
+- Fail toward letting Windows sleep. New failure paths must release the hold or expire it within a bounded grace period. Always-on (`on`/`off`, the MCP tools) is the one deliberate hold without T3 work: it is persisted, still goes through the keeper heartbeat, and an unreadable setting file counts as off. Parse that file strictly (a missing `until` must not read as "forever") and bound durations so a deadline can never overflow.
 - Rotate logs while running and preserve the current inode when rotating because the keeper's stderr is a cloned file handle.
 - Windows PowerShell 5.1 parses large hexadecimal flags as negative Int32 values; pass decimal uint flags.
 - `[Console]::In.ReadLineAsync()` blocks on PowerShell 5.1. Use a StreamReader over the raw stdin stream so the heartbeat timeout works.

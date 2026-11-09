@@ -143,7 +143,12 @@ fn serve(stream: &UnixStream, tx: &Sender<Msg>, status: &Mutex<Status>) -> io::R
             Some(Ok(always_on)) => {
                 let (reply_tx, reply_rx) = mpsc::channel();
                 let _ = tx.send(Msg::SetAlwaysOn(always_on, reply_tx));
-                reply_rx.recv_timeout(REPLY_TIMEOUT).unwrap_or_else(|_| "error daemon did not answer in time".into())
+                // The request stays queued and still applies, so say so rather than "failed".
+                reply_rx.recv_timeout(REPLY_TIMEOUT).unwrap_or_else(|_| {
+                    "error the daemon is busy reading T3; the change is queued and applies within seconds \
+                     (check `t3-keep-awake status`)"
+                        .into()
+                })
             }
             Some(Err(error)) => format!("error {error}"),
             None => format!("error unknown request {other:?}"),
@@ -158,10 +163,10 @@ fn parse_always_on(request: &str) -> Option<Result<Option<AlwaysOn>, String>> {
     let mut words = request.split_whitespace();
     let parsed = match (words.next()?, words.next(), words.next()) {
         ("always-off", None, None) => Ok(None),
-        ("always-on", None, None) => Ok(Some(AlwaysOn::starting(SystemTime::now(), None))),
+        ("always-on", None, None) => AlwaysOn::starting(SystemTime::now(), None).map(Some),
         ("always-on", Some(secs), None) => match secs.parse::<u64>() {
-            Ok(secs) if secs > 0 => Ok(Some(AlwaysOn::starting(SystemTime::now(), Some(Duration::from_secs(secs))))),
-            _ => Err(format!("invalid always-on duration {secs:?}")),
+            Ok(secs) => AlwaysOn::starting(SystemTime::now(), Some(Duration::from_secs(secs))).map(Some),
+            Err(_) => Err(format!("invalid always-on duration {secs:?}")),
         },
         ("always-on" | "always-off", ..) => Err(format!("invalid request {request:?}")),
         _ => return None,
@@ -189,10 +194,15 @@ struct Daemon {
     tracker: Tracker,
     decision: Decision,
     last_poll: Option<Instant>,
+    /// The last poll that could see T3 completely, or saw work. Read errors
+    /// advance `last_poll` but not this, so they cannot stretch a hold past
+    /// `MAX_SNAPSHOT_AGE` however long the grace period is.
+    last_good: Option<Instant>,
     poll_requested: bool,
     running_servers: usize,
     t3_errors: Vec<String>,
     t3_warnings: Vec<String>,
+    t3_runtime_warning: Option<String>,
     snapshot_expired: bool,
     keeper: Option<Keeper>,
     generation: u64,
@@ -207,11 +217,18 @@ impl Daemon {
         let always_on_path = paths.always_on();
         // A damaged file must not keep Windows awake; `on` or `off` rewrites it.
         let always_on = match AlwaysOn::load(&always_on_path) {
-            Ok(Some(always_on)) if !always_on.expired(SystemTime::now()) => {
+            Ok(Some(always_on)) if always_on.expired(SystemTime::now()) => {
+                log.line("always on: ended while the daemon was stopped");
+                if let Err(error) = AlwaysOn::clear(&always_on_path) {
+                    log.line(format!("{error:#}"));
+                }
+                None
+            }
+            Ok(Some(always_on)) => {
                 log.line(format!("{}: restored", always_on.describe(SystemTime::now())));
                 Some(always_on)
             }
-            Ok(_) => None,
+            Ok(None) => None,
             Err(error) => {
                 log.line(format!("ignoring always-on setting: {error:#}"));
                 None
@@ -229,10 +246,12 @@ impl Daemon {
             tracker: Tracker::default(),
             decision: Decision::default(),
             last_poll: None,
+            last_good: None,
             poll_requested: true,
             running_servers: 0,
             t3_errors: Vec::new(),
             t3_warnings: Vec::new(),
+            t3_runtime_warning: None,
             snapshot_expired: false,
             keeper: None,
             generation: 0,
@@ -269,12 +288,20 @@ impl Daemon {
         if self.poll_due(now) {
             self.poll();
         }
-        let now = Instant::now();
-        let (mut decision, expired) = current_decision(&self.decision, self.last_poll, now);
-        if expired && !self.snapshot_expired && self.always_on.is_none() {
-            self.log.line("release: T3 snapshot stale");
+        self.apply(Instant::now());
+    }
+
+    /// Everything after polling: combine the T3 decision with always-on, then
+    /// drive the keeper and publish status.
+    fn apply(&mut self, now: Instant) {
+        let (mut decision, expired) = current_decision(&self.decision, self.last_good, now);
+        // Under always-on the stale release is moot; note it once that ends.
+        if self.always_on.is_none() {
+            if expired && !self.snapshot_expired {
+                self.log.line("release: T3 snapshot stale");
+            }
+            self.snapshot_expired = expired;
         }
-        self.snapshot_expired = expired;
         let wall = SystemTime::now();
         if self.always_on.is_some_and(|always_on| always_on.expired(wall)) {
             self.always_on = None;
@@ -292,7 +319,8 @@ impl Daemon {
         self.publish_status(now, &decision);
     }
 
-    /// Saves before applying, so what `status` reports is what a restart restores.
+    /// Saves before applying, so what `status` reports is what a restart
+    /// restores. Replies without polling T3, so the client hears back promptly.
     fn set_always_on(&mut self, always_on: Option<AlwaysOn>) -> String {
         let saved = match always_on {
             Some(always_on) => always_on.save(&self.always_on_path),
@@ -311,7 +339,7 @@ impl Daemon {
             }
             None => {}
         }
-        self.tick(Instant::now());
+        self.apply(Instant::now());
         "ok".to_string()
     }
 
@@ -335,6 +363,10 @@ impl Daemon {
         let snapshot = self.t3.snapshot();
         let now = Instant::now();
         self.last_poll = Some(now);
+        let fresh = snapshot.complete() || !snapshot.threads.is_empty();
+        if fresh {
+            self.last_good = Some(now);
+        }
         self.poll_requested = false;
         self.running_servers = snapshot.running_servers;
         if snapshot.errors != self.t3_errors {
@@ -354,6 +386,13 @@ impl Daemon {
             }
             self.t3_warnings = snapshot.warnings.clone();
         }
+        if snapshot.complete() && snapshot.runtime_warning != self.t3_runtime_warning {
+            match &snapshot.runtime_warning {
+                Some(warning) => self.log.line(format!("warning: {warning}")),
+                None => self.log.line("T3: runtime-file warning cleared"),
+            }
+            self.t3_runtime_warning = snapshot.runtime_warning.clone();
+        }
 
         let decision = if snapshot.running_servers == 0 && snapshot.complete() {
             // A confirmed stopped or unresponsive server cannot authorize a
@@ -363,7 +402,7 @@ impl Daemon {
         } else {
             self.tracker.observe(&snapshot.threads, snapshot.complete(), now, &self.config)
         };
-        if decision.hold != self.decision.hold || (decision.hold && self.snapshot_expired) {
+        if decision.hold != self.decision.hold || (decision.hold && self.snapshot_expired && fresh) {
             // Always-on holds regardless, so T3's own verdict is only informational.
             let verb = match (self.always_on.is_some(), decision.hold) {
                 (true, true) => "T3 would hold",
@@ -380,7 +419,9 @@ impl Daemon {
             self.log.line(format!("ignoring as stuck: {}", decision.stale.join(", ")));
         }
         self.decision = decision;
-        self.snapshot_expired = false;
+        if fresh {
+            self.snapshot_expired = false;
+        }
     }
 
     fn reconcile(&mut self, now: Instant, hold: bool) {
@@ -557,7 +598,7 @@ impl Daemon {
             running_servers: self.running_servers,
             last_poll_secs_ago: self.last_poll.map_or(0, |at| now.duration_since(at).as_secs()),
             t3_errors: self.t3_errors.clone(),
-            t3_warnings: self.t3_warnings.clone(),
+            t3_warnings: self.t3_warnings.iter().chain(&self.t3_runtime_warning).cloned().collect(),
             keeper_failures: self.failures,
             retry_in_secs: self.retry_at.filter(|at| *at > now).map(|at| at.duration_since(now).as_secs()),
             always_on: self.always_on.is_some(),
@@ -593,8 +634,8 @@ impl Daemon {
     }
 }
 
-fn current_decision(decision: &Decision, last_poll: Option<Instant>, now: Instant) -> (Decision, bool) {
-    let expired = decision.hold && last_poll.is_some_and(|at| now.duration_since(at) >= MAX_SNAPSHOT_AGE);
+fn current_decision(decision: &Decision, last_good: Option<Instant>, now: Instant) -> (Decision, bool) {
+    let expired = decision.hold && last_good.is_none_or(|at| now.duration_since(at) >= MAX_SNAPSHOT_AGE);
     if expired {
         (Decision { hold: false, reason: "T3 snapshot stale".into(), ..Decision::default() }, true)
     } else {
@@ -620,5 +661,6 @@ mod tests {
         assert!(expired);
         assert!(!decision.hold);
         assert_eq!(decision.reason, "T3 snapshot stale");
+        assert!(current_decision(&working, None, polled).1, "a hold needs a good read behind it");
     }
 }
