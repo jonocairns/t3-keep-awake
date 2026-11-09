@@ -3,6 +3,7 @@ use std::env;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -16,8 +17,42 @@ use crate::util::truncate;
 
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const DATABASE_TIMEOUT: Duration = Duration::from_millis(500);
-/// The newest T3 database migration this reader has been checked against.
-const VERIFIED_MIGRATION: i64 = 54;
+
+/// The T3 databases this reader understands, newest first. T3 moved from
+/// `state.sqlite` to `statev2.sqlite` with its v2 orchestrator and left the old
+/// file behind, still readable but frozen. Only the file the live server holds
+/// open is current, so that, not which files exist, picks the reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Store {
+    V2,
+    Legacy,
+}
+
+impl Store {
+    const ALL: [Store; 2] = [Store::V2, Store::Legacy];
+
+    fn file(self) -> &'static str {
+        match self {
+            Store::V2 => "statev2.sqlite",
+            Store::Legacy => "state.sqlite",
+        }
+    }
+
+    /// The newest T3 database migration this store's reader has been checked against.
+    fn verified_migration(self) -> i64 {
+        match self {
+            Store::V2 => 79,
+            Store::Legacy => 54,
+        }
+    }
+
+    fn read_threads(self, connection: &Connection, server_id: &str, started_at: &str) -> Result<Vec<Thread>> {
+        match self {
+            Store::V2 => read_threads_v2(connection, server_id, started_at),
+            Store::Legacy => read_threads(connection, server_id, started_at),
+        }
+    }
+}
 
 pub struct Snapshot {
     pub running_servers: usize,
@@ -94,14 +129,15 @@ impl T3 {
             return Ok(Snapshot::offline());
         }
 
-        let database = self.data_dir.join("state.sqlite");
+        let store = open_store(&self.data_dir, runtime.pid, Path::new("/proc"))?;
+        let database = self.data_dir.join(store.file());
         let connection =
             Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
                 .with_context(|| format!("opening {} read-only", database.display()))?;
         connection.busy_timeout(DATABASE_TIMEOUT)?;
         let server_id = format!("{}:{}:{process_start}", self.data_dir.display(), runtime.started_at);
-        let warnings = schema_warning(&connection).into_iter().collect();
-        let threads = read_threads(&connection, &server_id, &runtime.started_at)?;
+        let warnings = schema_warning(&connection, store).into_iter().collect();
+        let threads = store.read_threads(&connection, &server_id, &runtime.started_at)?;
 
         // The process may have exited while SQLite was being read.
         if listening_process(&runtime, Path::new("/proc"))? != Some(process_start) {
@@ -109,6 +145,73 @@ impl T3 {
         }
         Ok(Snapshot { running_servers: 1, threads, errors: Vec::new(), warnings })
     }
+}
+
+/// Pick the store whose database file the T3 server process has open. A
+/// server holding none of them has moved its database somewhere this reader
+/// does not know, which must be an error rather than a quiet "no work".
+fn open_store(data_dir: &Path, pid: u32, proc_dir: &Path) -> Result<Store> {
+    let fd_dir = proc_dir.join(pid.to_string()).join("fd");
+    let open: HashSet<(u64, u64)> = fs::read_dir(&fd_dir)
+        .context("reading the T3 server's open files")?
+        .filter_map(|entry| fs::metadata(entry.ok()?.path()).ok())
+        .map(|metadata| (metadata.dev(), metadata.ino()))
+        .collect();
+    Store::ALL
+        .into_iter()
+        .find(|store| {
+            fs::metadata(data_dir.join(store.file()))
+                .is_ok_and(|metadata| open.contains(&(metadata.dev(), metadata.ino())))
+        })
+        .with_context(|| {
+            let files: Vec<_> = Store::ALL.iter().map(|store| store.file()).collect();
+            format!("the T3 server (pid {pid}) has none of {} open; T3 may have moved its database", files.join(", "))
+        })
+}
+
+/// T3's v2 orchestrator records a user message as a run, each try at it as a
+/// run attempt, and the provider's own work as provider turns. A run counts
+/// while its active attempt has a running provider turn started in this
+/// server's lifetime. A run that has `waiting` status is finalizing after its
+/// turn completed, and queued or preparing runs have no provider work yet.
+fn read_threads_v2(connection: &Connection, server_id: &str, started_at: &str) -> Result<Vec<Thread>> {
+    // Permission requests (T3's ProviderRequestKind) mark a run as blocked.
+    // Questions, MCP elicitations, and tool callbacks can coexist with work.
+    let mut query = connection
+        .prepare(
+            "SELECT t.thread_id, t.title, r.provider, r.ordinal,
+                    EXISTS (SELECT 1 FROM orchestration_v2_projection_runtime_requests q
+                            JOIN orchestration_v2_projection_nodes n ON n.node_id = q.node_id
+                            WHERE n.run_id = r.run_id AND q.status = 'pending'
+                              AND q.kind IN ('command', 'file-read', 'file-change', 'permission'))
+             FROM orchestration_v2_projection_threads t
+             JOIN orchestration_v2_projection_runs r ON r.thread_id = t.thread_id
+             JOIN orchestration_v2_projection_run_attempts a
+               ON a.attempt_id = json_extract(r.payload_json, '$.activeAttemptId') AND a.run_id = r.run_id
+             WHERE t.deleted_at IS NULL AND r.status = 'running' AND a.status = 'running'
+               AND EXISTS (SELECT 1 FROM orchestration_v2_projection_provider_turns p
+                           WHERE p.run_attempt_id = a.attempt_id AND p.status = 'running'
+                             AND p.started_at >= ?1)
+             ORDER BY t.thread_id, r.ordinal",
+        )
+        .context("reading T3 thread state (the database schema may have changed)")?;
+    let threads = query.query_map([started_at], |row| {
+        let id: String = row.get(0)?;
+        let title: String = row.get(1)?;
+        let provider: String = row.get(2)?;
+        let blocked: bool = row.get(4)?;
+        Ok(Thread {
+            id: format!("{server_id}/{id}"),
+            label: format!("{} {provider} \"{}\"", truncate(&id, 8), truncate(&title, 48)),
+            status: if blocked { ThreadStatus::Blocked } else { ThreadStatus::Working },
+            // Runs are numbered per thread; a steering restart or retry is a
+            // new attempt of the same run and keeps its stuck timer.
+            seq: u64::try_from(row.get::<_, i64>(3)?).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Integer, Box::new(error))
+            })?,
+        })
+    })?;
+    threads.collect::<rusqlite::Result<_>>().context("decoding T3 thread state")
 }
 
 fn read_threads(connection: &Connection, server_id: &str, started_at: &str) -> Result<Vec<Thread>> {
@@ -151,12 +254,13 @@ fn read_threads(connection: &Connection, server_id: &str, started_at: &str) -> R
 /// A newer schema can still satisfy the query while renaming the states it
 /// matches, which would silently hide work. Warn rather than fail: most T3
 /// migrations do not touch these projections.
-fn schema_warning(connection: &Connection) -> Option<String> {
+fn schema_warning(connection: &Connection, store: Store) -> Option<String> {
     let latest = connection
         .query_row("SELECT max(migration_id) FROM effect_sql_migrations", [], |row| row.get::<_, Option<i64>>(0));
+    let verified = store.verified_migration();
     match latest {
-        Ok(Some(latest)) if latest > VERIFIED_MIGRATION => Some(format!(
-            "T3 database migration {latest} is newer than the verified {VERIFIED_MIGRATION}; \
+        Ok(Some(latest)) if latest > verified => Some(format!(
+            "T3 database migration {latest} is newer than the verified {verified}; \
              working turns may go undetected"
         )),
         Ok(_) => None,
@@ -341,18 +445,203 @@ mod tests {
 
     #[test]
     fn a_newer_t3_schema_is_a_warning_and_the_read_continues() {
-        let connection = database();
-        let migrate = |id: i64| {
-            connection.execute("INSERT INTO effect_sql_migrations(migration_id, name) VALUES (?1, 'm')", [id]).unwrap()
+        for (store, connection) in [(Store::Legacy, database()), (Store::V2, database_v2())] {
+            let migrate = |id: i64| {
+                connection
+                    .execute("INSERT INTO effect_sql_migrations(migration_id, name) VALUES (?1, 'm')", [id])
+                    .unwrap()
+            };
+            assert_eq!(schema_warning(&connection, store), None, "a fresh database has no migrations yet");
+            migrate(store.verified_migration());
+            assert_eq!(schema_warning(&connection, store), None);
+            migrate(store.verified_migration() + 1);
+            assert!(schema_warning(&connection, store).unwrap().contains("is newer than the verified"));
+            assert_eq!(store.read_threads(&connection, "server", STARTED_AT).unwrap().len(), 1);
+            connection.execute_batch("DROP TABLE effect_sql_migrations;").unwrap();
+            assert!(schema_warning(&connection, store).unwrap().contains("cannot read the T3 schema version"));
+        }
+    }
+
+    const STARTED_AT: &str = "2026-10-03T09:00:00.000Z";
+
+    /// One thread with a running turn, shaped like T3 0.1.7 writes it.
+    fn database_v2() -> Connection {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(include_str!("../tests/fixtures/schema_v2.sql")).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO orchestration_v2_projection_threads VALUES ('thread', 'Fix the bug', NULL);
+                 INSERT INTO orchestration_v2_projection_runs VALUES
+                   ('run:1', 'thread', 1, 'claudeAgent', 'completed', '{\"activeAttemptId\":\"attempt:1\"}'),
+                   ('run:2', 'thread', 2, 'claudeAgent', 'running', '{\"activeAttemptId\":\"attempt:2\"}');
+                 INSERT INTO orchestration_v2_projection_run_attempts VALUES
+                   ('attempt:1', 'run:1', 'completed'), ('attempt:2', 'run:2', 'running');
+                 INSERT INTO orchestration_v2_projection_provider_turns VALUES
+                   ('turn:1', 'attempt:1', 'completed', '2026-10-03T09:30:00.000Z'),
+                   ('turn:2', 'attempt:2', 'running', '2026-10-03T10:00:00.000Z');
+                 INSERT INTO orchestration_v2_projection_nodes VALUES ('node:approval', 'run:2');",
+            )
+            .unwrap();
+        connection
+    }
+
+    fn threads_v2(connection: &Connection) -> Vec<Thread> {
+        read_threads_v2(connection, "server", STARTED_AT).unwrap()
+    }
+
+    #[test]
+    fn v2_a_running_provider_turn_in_the_active_attempt_counts() {
+        let running = threads_v2(&database_v2());
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].id, "server/thread");
+        assert_eq!(running[0].seq, 2);
+        assert_eq!(running[0].status, ThreadStatus::Working);
+        assert_eq!(running[0].label, "thread claudeAgent \"Fix the bug\"");
+    }
+
+    #[test]
+    fn v2_deleted_finalizing_queued_superseded_or_pre_restart_runs_do_not_count() {
+        for mutation in [
+            "UPDATE orchestration_v2_projection_threads SET deleted_at = '2026-10-03T10:01:00.000Z';",
+            // A completed provider turn leaves its run `waiting` while it finalizes.
+            "UPDATE orchestration_v2_projection_runs SET status = 'waiting' WHERE run_id = 'run:2';",
+            "UPDATE orchestration_v2_projection_runs SET status = 'queued' WHERE run_id = 'run:2';",
+            "UPDATE orchestration_v2_projection_provider_turns SET status = 'completed' WHERE provider_turn_id = 'turn:2';",
+            "UPDATE orchestration_v2_projection_run_attempts SET status = 'superseded' WHERE attempt_id = 'attempt:2';",
+            // The run's active attempt is another one; a running turn of an old attempt does not count.
+            "UPDATE orchestration_v2_projection_runs SET payload_json = '{\"activeAttemptId\":\"attempt:3\"}'
+               WHERE run_id = 'run:2';",
+            // An attempt of another run cannot confirm this one.
+            "UPDATE orchestration_v2_projection_run_attempts SET run_id = 'run:1' WHERE attempt_id = 'attempt:2';",
+            // Left running by a server that has since restarted.
+            "UPDATE orchestration_v2_projection_provider_turns SET started_at = '2026-10-03T08:00:00.000Z';",
+            "DELETE FROM orchestration_v2_projection_provider_turns WHERE provider_turn_id = 'turn:2';",
+        ] {
+            let connection = database_v2();
+            connection.execute_batch(mutation).unwrap();
+            assert!(threads_v2(&connection).is_empty(), "mutation: {mutation}");
+        }
+    }
+
+    #[test]
+    fn v2_permissions_are_blocked_but_questions_and_resolved_requests_are_not() {
+        let connection = database_v2();
+        let request = |kind: &str, status: &str| {
+            connection
+                .execute_batch(&format!(
+                    "DELETE FROM orchestration_v2_projection_runtime_requests;
+                     INSERT INTO orchestration_v2_projection_runtime_requests
+                       VALUES ('request', 'node:approval', '{kind}', '{status}');"
+                ))
+                .unwrap();
+            threads_v2(&connection)[0].status
         };
-        assert_eq!(schema_warning(&connection), None, "a fresh database has no migrations yet");
-        migrate(VERIFIED_MIGRATION);
-        assert_eq!(schema_warning(&connection), None);
-        migrate(VERIFIED_MIGRATION + 1);
-        assert!(schema_warning(&connection).unwrap().contains("is newer than the verified"));
-        assert_eq!(threads(&connection).len(), 1);
-        connection.execute_batch("DROP TABLE effect_sql_migrations;").unwrap();
-        assert!(schema_warning(&connection).unwrap().contains("cannot read the T3 schema version"));
+        for kind in ["command", "file-read", "file-change", "permission"] {
+            assert_eq!(request(kind, "pending"), ThreadStatus::Blocked, "{kind}");
+            assert_eq!(request(kind, "resolved"), ThreadStatus::Working, "{kind}");
+        }
+        for kind in ["user_input", "mcp-elicitation", "dynamic_tool_call"] {
+            assert_eq!(request(kind, "pending"), ThreadStatus::Working, "{kind}");
+        }
+        connection.execute_batch("UPDATE orchestration_v2_projection_nodes SET run_id = 'run:1';").unwrap();
+        assert_eq!(request("command", "pending"), ThreadStatus::Working, "another run's approval");
+    }
+
+    #[test]
+    fn v2_a_new_run_has_a_new_identity_but_a_retry_does_not() {
+        let connection = database_v2();
+        let first = threads_v2(&connection).remove(0);
+        connection
+            .execute_batch(
+                "INSERT INTO orchestration_v2_projection_run_attempts VALUES ('attempt:2b', 'run:2', 'running');
+                 UPDATE orchestration_v2_projection_run_attempts SET status = 'superseded' WHERE attempt_id = 'attempt:2';
+                 UPDATE orchestration_v2_projection_runs SET payload_json = '{\"activeAttemptId\":\"attempt:2b\"}'
+                   WHERE run_id = 'run:2';
+                 INSERT INTO orchestration_v2_projection_provider_turns
+                   VALUES ('turn:2b', 'attempt:2b', 'running', '2026-10-03T10:05:00.000Z');",
+            )
+            .unwrap();
+        let retried = threads_v2(&connection).remove(0);
+        assert_eq!((first.id.as_str(), first.seq), (retried.id.as_str(), retried.seq));
+        connection
+            .execute_batch(
+                "UPDATE orchestration_v2_projection_runs SET status = 'completed' WHERE run_id = 'run:2';
+                 INSERT INTO orchestration_v2_projection_runs VALUES
+                   ('run:3', 'thread', 3, 'claudeAgent', 'running', '{\"activeAttemptId\":\"attempt:3\"}');
+                 INSERT INTO orchestration_v2_projection_run_attempts VALUES ('attempt:3', 'run:3', 'running');
+                 INSERT INTO orchestration_v2_projection_provider_turns
+                   VALUES ('turn:3', 'attempt:3', 'running', '2026-10-03T10:10:00.000Z');",
+            )
+            .unwrap();
+        let next = threads_v2(&connection).remove(0);
+        assert_eq!(first.id, next.id);
+        assert_ne!(first.seq, next.seq);
+    }
+
+    #[test]
+    fn v2_schema_changes_are_reported_as_errors() {
+        let connection = Connection::open_in_memory().unwrap();
+        let error = read_threads_v2(&connection, "server", STARTED_AT).unwrap_err();
+        assert!(error.to_string().contains("database schema may have changed"));
+    }
+
+    struct FakeProc {
+        root: PathBuf,
+    }
+
+    impl FakeProc {
+        fn new(name: &str) -> Self {
+            let root = env::temp_dir().join(format!("tka-store-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(root.join("userdata")).unwrap();
+            fs::create_dir_all(root.join("proc/7/fd")).unwrap();
+            Self { root }
+        }
+
+        fn userdata(&self) -> PathBuf {
+            self.root.join("userdata")
+        }
+
+        fn create(&self, file: &str) {
+            fs::write(self.userdata().join(file), "").unwrap();
+        }
+
+        fn hold_open(&self, fd: u32, file: &str) {
+            std::os::unix::fs::symlink(self.userdata().join(file), self.root.join(format!("proc/7/fd/{fd}"))).unwrap();
+        }
+
+        fn store(&self) -> Result<Store> {
+            open_store(&self.userdata(), 7, &self.root.join("proc"))
+        }
+    }
+
+    impl Drop for FakeProc {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn the_database_the_server_holds_open_picks_the_reader() {
+        let fake = FakeProc::new("pick");
+        fake.create("state.sqlite");
+        fake.hold_open(3, "state.sqlite");
+        assert_eq!(fake.store().unwrap(), Store::Legacy, "an older T3 only has state.sqlite");
+        fake.create("statev2.sqlite");
+        assert_eq!(fake.store().unwrap(), Store::Legacy, "a v2 file the server does not use is ignored");
+        fake.hold_open(4, "statev2.sqlite");
+        assert_eq!(fake.store().unwrap(), Store::V2);
+    }
+
+    #[test]
+    fn a_frozen_old_database_is_not_read_when_the_server_moved_on() {
+        let fake = FakeProc::new("moved");
+        fake.create("state.sqlite");
+        fake.create("statev3.sqlite");
+        fake.hold_open(3, "statev3.sqlite");
+        let error = fake.store().unwrap_err().to_string();
+        assert!(error.contains("has none of statev2.sqlite, state.sqlite open"), "{error}");
+        assert!(error.contains("may have moved its database"), "{error}");
     }
 
     #[test]

@@ -13,7 +13,7 @@ pub const MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(60);
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// T3 Code userdata directory (contains state.sqlite and server-runtime.json).
+    /// T3 Code userdata directory (contains statev2.sqlite and server-runtime.json).
     pub t3_data_dir: Option<std::path::PathBuf>,
     /// How often T3 thread state is polled while its server is running.
     pub poll_secs: u64,

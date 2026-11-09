@@ -31,9 +31,11 @@ fn request(paths: &Paths, command: &str) -> Result<String> {
     if let Some(error) = reply.strip_prefix("error ") {
         bail!("daemon: {error}");
     }
-    match command {
-        "nudge" | "stop" if reply != "ok" => bail!("unexpected daemon reply: {reply:?}"),
-        "status" => {
+    match command.split_whitespace().next() {
+        Some("nudge" | "stop" | "always-on" | "always-off") if reply != "ok" => {
+            bail!("unexpected daemon reply: {reply:?}")
+        }
+        Some("status") => {
             let _: Status = serde_json::from_str(reply).context("invalid daemon status reply")?;
         }
         _ => {}
@@ -60,10 +62,45 @@ pub fn status(json: bool) -> Result<()> {
     if json {
         println!("{reply}");
     } else {
-        let status: Status = serde_json::from_str(&reply).context("parsing status")?;
-        print!("{}", status.render());
+        print!("{}", parse_status(&reply)?.render());
     }
     Ok(())
+}
+
+fn parse_status(reply: &str) -> Result<Status> {
+    serde_json::from_str(reply).context("parsing status")
+}
+
+/// The rendered status, for callers that report rather than print it.
+pub fn status_text() -> Result<String> {
+    let paths = Paths::resolve()?;
+    let reply =
+        request(&paths, "status").with_context(|| format!("daemon is not running; see {}", paths.log().display()))?;
+    Ok(parse_status(&reply)?.render())
+}
+
+/// Keep Windows awake regardless of T3, until turned off or for `duration`.
+/// Starts the daemon if needed and returns the resulting status.
+pub fn always_on(duration: Option<Duration>) -> Result<String> {
+    let command = match duration {
+        Some(duration) => format!("always-on {}", duration.as_secs().max(1)),
+        None => "always-on".to_string(),
+    };
+    set_mode(&command)
+}
+
+/// Return to holding only while T3 threads work.
+pub fn always_off() -> Result<String> {
+    set_mode("always-off")
+}
+
+fn set_mode(command: &str) -> Result<String> {
+    let paths = Paths::resolve()?;
+    if request(&paths, "nudge").is_err() {
+        nudge()?;
+    }
+    request(&paths, command)?;
+    status_text()
 }
 
 pub fn stop() -> Result<()> {

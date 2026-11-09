@@ -1,9 +1,11 @@
+mod always_on;
 mod client;
 mod config;
 mod daemon;
 mod decide;
 mod keeper;
 mod log;
+mod mcp;
 mod paths;
 mod process;
 mod status;
@@ -21,12 +23,16 @@ Usage: t3-keep-awake <command>
 
 Commands:
   status [--json]  Show whether Windows is being held awake, and why
+  on [DURATION]    Keep Windows awake regardless of T3, until `off` or for
+                   DURATION (90m, 2h, 1h30m); survives restarts until then
+  off              Go back to keeping Windows awake only while T3 works
   log [LINES]      Print the last LINES of the daemon log (default 20)
   probe            Read Windows' system-wide execution state
   restart          Restart the daemon (applies config and binary changes)
   stop             Stop the daemon and release any hold
   start            Start the daemon if needed and refresh thread state
   daemon           Run the daemon in the foreground
+  mcp              Serve on/off/status as MCP tools over stdio
 
 Config: ~/.config/t3-keep-awake/config.toml
 State:  ~/.local/state/t3-keep-awake/
@@ -49,6 +55,20 @@ fn run(args: &[String]) -> Result<()> {
         Some("start") => client::nudge(),
         Some("daemon") => daemon::run(),
         Some("status") => client::status(flag("--json")),
+        Some("on") => {
+            let duration = match args.get(1..) {
+                Some([]) | None => None,
+                Some([text]) => Some(util::parse_duration(text).map_err(|error| anyhow!(error))?),
+                Some(_) => return Err(anyhow!("usage: t3-keep-awake on [DURATION]")),
+            };
+            print!("{}", client::always_on(duration)?);
+            Ok(())
+        }
+        Some("off") => {
+            print!("{}", client::always_off()?);
+            Ok(())
+        }
+        Some("mcp") => mcp::serve(),
         Some("log") => {
             let lines = args.get(1).map(|n| n.parse()).transpose()?.unwrap_or(20);
             client::print_log(lines)

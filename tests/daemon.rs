@@ -46,9 +46,11 @@ impl Harness {
         fs::write(dir.join("keeper"), FAKE_KEEPER).unwrap();
         fs::set_permissions(dir.join("keeper"), fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(dir.join("config.toml"), CONFIG).unwrap();
-        let database = Connection::open(dir.join("userdata/state.sqlite")).unwrap();
+        // The test process stands in for the T3 server, so this connection is
+        // also what makes the daemon pick statev2.sqlite.
+        let database = Connection::open(dir.join("userdata/statev2.sqlite")).unwrap();
         database.pragma_update(None, "journal_mode", "WAL").unwrap();
-        database.execute_batch(include_str!("fixtures/schema.sql")).unwrap();
+        database.execute_batch(include_str!("fixtures/schema_v2.sql")).unwrap();
 
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -123,37 +125,50 @@ impl Harness {
         let transaction = self.database.unchecked_transaction().unwrap();
         transaction
             .execute_batch(
-                "DELETE FROM projection_threads; DELETE FROM projection_thread_sessions;
-             DELETE FROM provider_session_runtime; DELETE FROM projection_turns;",
+                "DELETE FROM orchestration_v2_projection_threads; DELETE FROM orchestration_v2_projection_runs;
+                 DELETE FROM orchestration_v2_projection_run_attempts;
+                 DELETE FROM orchestration_v2_projection_provider_turns;
+                 DELETE FROM orchestration_v2_projection_nodes;
+                 DELETE FROM orchestration_v2_projection_runtime_requests;",
             )
             .unwrap();
         for (id, state) in threads {
-            let turn = format!("turn-{id}");
+            let (run, attempt) = (format!("run-{id}"), format!("attempt-{id}"));
             let running = matches!(*state, "working" | "blocked");
+            let status = if running { "running" } else { "completed" };
+            transaction.execute("INSERT INTO orchestration_v2_projection_threads VALUES (?1, ?1, NULL)", [id]).unwrap();
             transaction
                 .execute(
-                    "INSERT INTO projection_threads(thread_id,title,pending_approval_count) VALUES (?1,?1,?2)",
-                    rusqlite::params![id, *state == "blocked"],
+                    "INSERT INTO orchestration_v2_projection_runs VALUES (?1, ?2, 1, 'codex', ?3, ?4)",
+                    rusqlite::params![run, id, status, serde_json::json!({"activeAttemptId": attempt}).to_string()],
                 )
                 .unwrap();
             transaction
                 .execute(
-                    "INSERT INTO projection_thread_sessions VALUES (?1,?2,?3)",
-                    rusqlite::params![id, if running { "running" } else { "ready" }, turn],
+                    "INSERT INTO orchestration_v2_projection_run_attempts VALUES (?1, ?2, ?3)",
+                    rusqlite::params![attempt, run, status],
                 )
                 .unwrap();
             transaction
                 .execute(
-                    "INSERT INTO provider_session_runtime VALUES (?1,'codex','running',?2,?3)",
-                    rusqlite::params![id, STARTED_AT, serde_json::json!({"activeTurnId":turn}).to_string()],
+                    "INSERT INTO orchestration_v2_projection_provider_turns VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![format!("turn-{id}"), attempt, status, STARTED_AT],
                 )
                 .unwrap();
-            transaction
-                .execute(
-                    "INSERT INTO projection_turns(thread_id,turn_id,state) VALUES (?1,?2,?3)",
-                    rusqlite::params![id, turn, if running { "running" } else { "completed" }],
-                )
-                .unwrap();
+            if *state == "blocked" {
+                transaction
+                    .execute(
+                        "INSERT INTO orchestration_v2_projection_nodes VALUES (?1, ?2)",
+                        rusqlite::params![format!("node-{id}"), run],
+                    )
+                    .unwrap();
+                transaction
+                    .execute(
+                        "INSERT INTO orchestration_v2_projection_runtime_requests VALUES (?1, ?1, 'command', 'pending')",
+                        [format!("node-{id}")],
+                    )
+                    .unwrap();
+            }
         }
         transaction.commit().unwrap();
     }
@@ -338,11 +353,30 @@ fn an_incompatible_database_releases_and_recovers_without_restart() {
     h.set_threads(&[("thread", "working")]);
     h.run(&["start"]);
     h.wait_for("the hold", holding);
-    h.database.execute_batch("ALTER TABLE projection_threads RENAME TO incompatible_threads;").unwrap();
+    h.database.execute_batch("ALTER TABLE orchestration_v2_projection_runs RENAME TO incompatible_runs;").unwrap();
     h.wait_for("the release", |s| s["hold"] == false && s["reason"] == "T3 unreadable");
     assert!(h.log().contains("database schema may have changed"));
-    h.database.execute_batch("ALTER TABLE incompatible_threads RENAME TO projection_threads;").unwrap();
+    h.database.execute_batch("ALTER TABLE incompatible_runs RENAME TO orchestration_v2_projection_runs;").unwrap();
     h.wait_for("the recovered hold", holding);
+}
+
+#[test]
+fn a_database_the_server_no_longer_uses_is_an_error_not_an_idle_server() {
+    let h = Harness::new("moved");
+    h.set_threads(&[("thread", "working")]);
+    // A frozen database from an older T3 still has every table its reader needs.
+    let frozen = Connection::open(h.dir.join("userdata/state.sqlite")).unwrap();
+    frozen.execute_batch(include_str!("fixtures/schema.sql")).unwrap();
+    drop(frozen);
+    h.run(&["start"]);
+    h.wait_for("the hold", holding);
+    let moved = h.dir.join("userdata/statev3.sqlite");
+    fs::rename(h.dir.join("userdata/statev2.sqlite"), &moved).unwrap();
+    let status = h.wait_for("the release", |s| s["hold"] == false && s["reason"] == "T3 unreadable");
+    assert!(status["t3_errors"][0].as_str().unwrap().contains("may have moved its database"), "{status}");
+    fs::rename(&moved, h.dir.join("userdata/statev2.sqlite")).unwrap();
+    h.wait_for("the recovered hold", holding);
+    assert!(h.log().contains("T3: readable again"));
 }
 
 #[test]
@@ -397,4 +431,74 @@ fn a_runtime_pid_that_does_not_own_the_listener_is_ignored() {
     assert!(h.keeper_log().is_empty());
     unrelated.kill().unwrap();
     unrelated.wait().unwrap();
+}
+
+#[test]
+fn always_on_holds_without_t3_survives_a_restart_and_off_releases() {
+    let h = Harness::new("always-on");
+    h.set_server_running(false);
+    h.run(&["start"]);
+    h.wait_for("the absent server", |s| s["reason"] == "T3 server not running");
+    let on = String::from_utf8(h.run(&["on"]).stdout).unwrap();
+    assert!(on.contains("mode     always on until `t3-keep-awake off`"), "{on}");
+    let first = h.wait_for("the always-on hold", |s| holding(s) && s["always_on"] == true);
+    assert_eq!(first["reason"], "always on");
+    h.run(&["restart"]);
+    h.wait_for_keeper_exit(keeper_pid(&first));
+    let restored = h.wait_for("the restored hold", |s| holding(s) && s["daemon_pid"] != first["daemon_pid"]);
+    assert_eq!(restored["always_on"], true);
+    assert!(h.log().contains("always on until turned off: restored"));
+    let off = String::from_utf8(h.run(&["off"]).stdout).unwrap();
+    assert!(off.contains("mode     automatic"), "{off}");
+    h.wait_for("the release", |s| s["hold"] == false && s["keeper"].is_null());
+    h.wait_for_keeper_exit(keeper_pid(&restored));
+    assert!(!h.dir.join("state/always-on.json").exists());
+}
+
+#[test]
+fn a_timed_always_on_lapses_back_to_automatic() {
+    let h = Harness::new("always-on-timed");
+    h.run(&["start"]);
+    h.run(&["on", "3s"]);
+    let status = h.wait_for("the timed hold", |s| holding(s) && s["always_on_until"].is_string());
+    assert_eq!(status["reason"], "always on");
+    assert!(status["always_on_left_secs"].as_u64().unwrap() <= 3, "{status}");
+    h.wait_for("the lapse", |s| s["hold"] == false && s["always_on"] == false && s["keeper"].is_null());
+    assert!(h.log().contains("always on: ended; releasing: no threads working"), "{}", h.log());
+    let error = h.command(&["on", "90"]).output().unwrap();
+    assert!(!error.status.success());
+    assert!(String::from_utf8_lossy(&error.stderr).contains("invalid duration"));
+}
+
+#[test]
+fn the_mcp_tools_drive_the_daemon() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let h = Harness::new("mcp");
+    h.run(&["start"]);
+    let mut server = h.command(&["mcp"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    let mut stdin = server.stdin.take().unwrap();
+    let mut stdout = BufReader::new(server.stdout.take().unwrap());
+    let mut send = |message: Value| -> Value {
+        writeln!(stdin, "{message}").unwrap();
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    };
+    let call = |name: &str, arguments: Value| {
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                           "params": {"name": name, "arguments": arguments}})
+    };
+    let init = send(serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}));
+    assert_eq!(init["result"]["serverInfo"]["name"], "t3-keep-awake");
+    let on = send(call("always_on", serde_json::json!({"duration": "2h"})));
+    assert_eq!(on["result"]["isError"], false, "{on}");
+    assert!(on["result"]["content"][0]["text"].as_str().unwrap().contains("mode     always on for "), "{on}");
+    h.wait_for("the hold", |s| holding(s) && s["always_on"] == true);
+    let off = send(call("always_off", serde_json::json!({})));
+    assert!(off["result"]["content"][0]["text"].as_str().unwrap().contains("mode     automatic"), "{off}");
+    h.wait_for("the release", |s| s["hold"] == false && s["keeper"].is_null());
+    drop(stdin);
+    assert!(server.wait().unwrap().success());
 }

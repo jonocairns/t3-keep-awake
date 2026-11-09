@@ -23,6 +23,14 @@ pub struct Status {
     pub t3_warnings: Vec<String>,
     pub keeper_failures: u32,
     pub retry_in_secs: Option<u64>,
+    /// Older daemons have no always-on mode.
+    #[serde(default)]
+    pub always_on: bool,
+    /// When a timed always-on hold ends, as a UTC timestamp.
+    #[serde(default)]
+    pub always_on_until: Option<String>,
+    #[serde(default)]
+    pub always_on_left_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -47,6 +55,12 @@ impl Status {
         };
         let _ = writeln!(out, "state    {headline}");
         let _ = writeln!(out, "reason   {}", self.reason);
+        let mode = match (self.always_on, self.always_on_left_secs, &self.always_on_until) {
+            (true, Some(left), Some(until)) => format!("always on for {} more (until {until})", secs(left)),
+            (true, ..) => "always on until `t3-keep-awake off`".to_string(),
+            (false, ..) => "automatic: awake only while T3 threads work".to_string(),
+        };
+        let _ = writeln!(out, "mode     {mode}");
         list(&mut out, "working", &self.active);
         list(&mut out, "stuck", &self.stale);
         match &self.keeper {
@@ -109,5 +123,23 @@ mod tests {
         assert_eq!(headline(true, None), "state    WANTED: starting the keeper");
         assert_eq!(headline(false, Some("releasing")), "state    RELEASING");
         assert_eq!(headline(false, None), "state    idle: Windows may sleep");
+    }
+
+    fn mode(status: Status) -> String {
+        status.render().lines().find(|line| line.starts_with("mode")).unwrap().to_string()
+    }
+
+    #[test]
+    fn the_mode_line_says_whether_and_how_long_it_is_always_on() {
+        assert_eq!(mode(Status::default()), "mode     automatic: awake only while T3 threads work");
+        let open = Status { always_on: true, ..Status::default() };
+        assert_eq!(mode(open), "mode     always on until `t3-keep-awake off`");
+        let timed = Status {
+            always_on: true,
+            always_on_until: Some("2026-11-09T12:00:00Z".into()),
+            always_on_left_secs: Some(5400),
+            ..Status::default()
+        };
+        assert_eq!(mode(timed), "mode     always on for 1h30m more (until 2026-11-09T12:00:00Z)");
     }
 }
